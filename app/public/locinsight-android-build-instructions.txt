@@ -1,0 +1,106 @@
+============================================================
+LocInsights Android APK — Build Instructions (v4.2 — Aug 2026)
+============================================================
+
+LocInsights is shipped as a PWA (Progressive Web App). To distribute
+it as a native .apk file for Android, we use Google's official
+Bubblewrap CLI (Trusted Web Activity wrapper).
+
+PREREQUISITES:
+  - Node.js 18+ and npm
+  - Java JDK 17+ (OpenJDK recommended)
+  - Android SDK (Bubblewrap will auto-install via sdkmanager)
+  - Internet connection
+
+----------------------------------------------------------------------
+FULL-SCREEN / NO BROWSER TOP BAR — IMPORTANT
+----------------------------------------------------------------------
+The TWA APK must verify ownership of the domain via Digital Asset
+Links. Without this verification, the TWA falls back to a Chrome
+Custom Tab — which shows the browser URL bar at the top. To get a
+true full-screen experience:
+
+  1. After running `bubblewrap build` once, locate the generated
+     assetlinks.json file (Bubblewrap prints its path at the end of
+     the build). It contains the SHA-256 fingerprint of your signing
+     key.
+
+  2. Copy that assetlinks.json into the Next.js public folder so it
+     is served at:
+        https://locinsights.bayhaqy.my.id/.well-known/assetlinks.json
+
+     The repo already has a template at:
+        public/.well-known/assetlinks.json
+     Replace the placeholder fingerprint with the real one printed
+     by Bubblewrap.
+
+  3. Deploy the Next.js app (Vercel auto-deploys from main branch).
+
+  4. Re-open the APK — the URL bar will be gone, and the app will
+     run true full-screen.
+
+The current twa-manifest.json sets:
+  "display": "fullscreen"            (hides Android status bar)
+  "fallbackType": "customtabs"       (used only if assetlinks fails)
+
+----------------------------------------------------------------------
+STEP-BY-STEP BUILD:
+----------------------------------------------------------------------
+  1. Install Bubblewrap CLI globally:
+        npm install -g @bubblewrap/cli
+
+  2. Initialize the project from the live PWA manifest:
+        bubblewrap init --manifest https://locinsights.bayhaqy.my.id/manifest.json
+
+     This will create:
+       - twa-manifest.json    (TWA configuration)
+       - android-project/     (Gradle Android project)
+       - signing-key.pem      (app signing key — KEEP SAFE)
+
+  3. (Optional) Edit twa-manifest.json to set:
+       - packageId: id.my.bayhaqy.locinsight
+       - name: LocInsights
+       - launcherName: LocInsights
+       - themeColor: #7A0A1A
+       - navigationColor: #1A1815
+       - backgroundColor: #FAF7F2
+       - display: fullscreen        ← hides the status bar
+       - appVersion: "4.2.0"
+       - maskableIconUrl: /logo-maskable-512.png
+
+  4. Build the signed APK:
+        bubblewrap build
+
+     Output: app-release-signed.apk (in ./app-release-signed.apk)
+
+  5. (REQUIRED for full-screen) After the build completes, Bubblewrap
+     prints the assetlinks.json content. Update:
+        public/.well-known/assetlinks.json
+     with the real SHA-256 fingerprint, then commit + push to deploy.
+
+  6. Copy the signed APK into the repo for direct download:
+        cp app-release-signed.apk public/locinsights.apk
+
+  7. (Optional) Generate Android App Bundle for Play Store:
+        bubblewrap build --type bundle
+
+     Output: app-release-bundle.aab
+
+----------------------------------------------------------------------
+INSTALL ON DEVICE (sideload):
+----------------------------------------------------------------------
+  - Transfer app-release-signed.apk to your Android phone
+  - Enable "Install from unknown sources" in Settings
+  - Tap the .apk file to install
+  - Open LocInsights from your app drawer
+
+ALTERNATIVE: PWA INSTALL (no APK needed)
+  - Open https://locinsights.bayhaqy.my.id in Chrome on Android
+  - Tap the menu (⋮) → "Install app"
+  - LocInsights appears in your app drawer, runs full-screen
+  - Same features, same offline capability, no .apk needed
+
+DEVELOPER CONTACT:
+  Achmad Bayhaqy — https://bayhaqy.my.id
+
+============================================================

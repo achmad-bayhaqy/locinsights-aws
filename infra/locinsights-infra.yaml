@@ -1,0 +1,530 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  LocInsights production infrastructure on AWS (us-east-1).
+  CloudFront (HTTPS) -> ALB (origin header check) -> ECS Fargate (Next.js 16 standalone)
+  -> RDS PostgreSQL 17 + PostGIS (private subnets). Static ML explorer on S3 + CloudFront.
+  All resources prefixed with "locinsights".
+
+Parameters:
+  DbPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for RDS locinsights-db (alphanumeric)
+    MinLength: 12
+  NextAuthSecret:
+    Type: String
+    NoEcho: true
+    Description: NextAuth JWT signing secret
+    MinLength: 16
+  OriginSecret:
+    Type: String
+    NoEcho: true
+    Description: Shared secret header value between CloudFront and ALB
+
+Resources:
+  # ---------------- Networking ----------------
+  LocInsightsVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: locinsights-vpc}, {Key: app, Value: locinsights}]
+
+  LocInsightsIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: locinsights-igw}]
+
+  LocInsightsVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      InternetGatewayId: !Ref LocInsightsIGW
+
+  LocInsightsPublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      CidrBlock: 10.42.0.0/20
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: locinsights-public-a}]
+
+  LocInsightsPublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      CidrBlock: 10.42.16.0/20
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: locinsights-public-b}]
+
+  LocInsightsPrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      CidrBlock: 10.42.128.0/20
+      AvailabilityZone: us-east-1a
+      Tags: [{Key: Name, Value: locinsights-private-a}]
+
+  LocInsightsPrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      CidrBlock: 10.42.144.0/20
+      AvailabilityZone: us-east-1b
+      Tags: [{Key: Name, Value: locinsights-private-b}]
+
+  LocInsightsPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      Tags: [{Key: Name, Value: locinsights-public-rt}]
+
+  LocInsightsPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: LocInsightsVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref LocInsightsPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LocInsightsIGW
+
+  LocInsightsPublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LocInsightsPublicSubnetA
+      RouteTableId: !Ref LocInsightsPublicRouteTable
+
+  LocInsightsPublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LocInsightsPublicSubnetB
+      RouteTableId: !Ref LocInsightsPublicRouteTable
+
+  LocInsightsPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LocInsightsVPC
+      Tags: [{Key: Name, Value: locinsights-private-rt}]
+
+  LocInsightsPrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LocInsightsPrivateSubnetA
+      RouteTableId: !Ref LocInsightsPrivateRouteTable
+
+  LocInsightsPrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LocInsightsPrivateSubnetB
+      RouteTableId: !Ref LocInsightsPrivateRouteTable
+
+  # ---------------- Security Groups ----------------
+  LocInsightsALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: locinsights-alb-sg - HTTP from CloudFront origin-facing prefix list only
+      VpcId: !Ref LocInsightsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: pl-3b927c52  # com.amazonaws.global.cloudfront.origin-facing
+      Tags: [{Key: Name, Value: locinsights-alb-sg}]
+
+  LocInsightsECSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: locinsights-ecs-sg - app port 3000 from ALB only
+      VpcId: !Ref LocInsightsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !GetAtt LocInsightsALBSG.GroupId
+      Tags: [{Key: Name, Value: locinsights-ecs-sg}]
+
+  LocInsightsRDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: locinsights-rds-sg - postgres 5432 from ECS tasks only
+      VpcId: !Ref LocInsightsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt LocInsightsECSSG.GroupId
+      Tags: [{Key: Name, Value: locinsights-rds-sg}]
+
+  # ---------------- Secrets ----------------
+  LocInsightsAppSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: LocInsightsDB
+    Properties:
+      Name: locinsights/app
+      Description: LocInsights application secrets (DB URL + NextAuth + ZAI)
+      SecretString: !Sub
+        - '{"DATABASE_URL":"postgresql://locinsights_admin:${DbPassword}@${DbHost}:5432/locinsights?schema=public&sslmode=require","DIRECT_URL":"postgresql://locinsights_admin:${DbPassword}@${DbHost}:5432/locinsights?schema=public&sslmode=require","NEXTAUTH_SECRET":"${NextAuthSecret}"}'
+        - DbHost: !GetAtt LocInsightsDB.Endpoint.Address
+
+  # ---------------- Database ----------------
+  LocInsightsDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: locinsights-db-subnets (private)
+      DBSubnetGroupName: locinsights-db-subnets
+      SubnetIds:
+        - !Ref LocInsightsPrivateSubnetA
+        - !Ref LocInsightsPrivateSubnetB
+
+  LocInsightsDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: locinsights-db
+      DBName: locinsights
+      Engine: postgres
+      EngineVersion: "17.11"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: locinsights_admin
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref LocInsightsDBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt LocInsightsRDSSG.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "18:00-18:30"
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      Tags:
+        - {Key: Name, Value: locinsights-db}
+        - {Key: app, Value: locinsights}
+
+  # ---------------- IAM ----------------
+  LocInsightsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: locinsights-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: locinsights-secrets-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref LocInsightsAppSecret
+
+  LocInsightsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: locinsights-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: locinsights-bedrock-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: !Sub arn:aws:bedrock:*:${AWS::AccountId}:foundation-model/*
+        - PolicyName: locinsights-artifacts-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::locinsights-*/*
+
+  LocInsightsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/locinsights-web
+      RetentionInDays: 14
+      Tags: [{Key: app, Value: locinsights}]
+
+  # ---------------- ECS ----------------
+  LocInsightsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: locinsights-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags: [{Key: app, Value: locinsights}]
+
+  LocInsightsTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: locinsights-web
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt LocInsightsExecutionRole.Arn
+      TaskRoleArn: !GetAtt LocInsightsTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: locinsights-web
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/locinsights/web:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - {Name: NODE_ENV, Value: production}
+            - {Name: PORT, Value: "3000"}
+            - {Name: HOSTNAME, Value: "0.0.0.0"}
+            - {Name: NEXT_TELEMETRY_DISABLED, Value: "1"}
+            - {Name: NEXTAUTH_URL, Value: !Sub "https://${LocInsightsAppDistribution.DomainName}"}
+          Secrets:
+            - {Name: DATABASE_URL, ValueFrom: !Sub "${LocInsightsAppSecret}:DATABASE_URL::"}
+            - {Name: DIRECT_URL, ValueFrom: !Sub "${LocInsightsAppSecret}:DIRECT_URL::"}
+            - {Name: NEXTAUTH_SECRET, ValueFrom: !Sub "${LocInsightsAppSecret}:NEXTAUTH_SECRET::"}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/locinsights-web
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+      Tags: [{Key: app, Value: locinsights}]
+
+  LocInsightsService:
+    Type: AWS::ECS::Service
+    DependsOn: LocInsightsWebListener
+    Properties:
+      ServiceName: locinsights-web-service
+      Cluster: !Ref LocInsightsCluster
+      TaskDefinition: !Ref LocInsightsTaskDef
+      DesiredCount: 0  # dinaikkan ke 1 setelah image ECR siap (hindari circuit breaker saat initial deploy)
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !GetAtt LocInsightsECSSG.GroupId
+          Subnets:
+            - !Ref LocInsightsPublicSubnetA
+            - !Ref LocInsightsPublicSubnetB
+      LoadBalancers:
+        - TargetGroupArn: !Ref LocInsightsTargetGroup
+          ContainerName: locinsights-web
+          ContainerPort: 3000
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+      Tags: [{Key: app, Value: locinsights}]
+
+  # ---------------- ALB ----------------
+  LocInsightsALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: locinsights-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !GetAtt LocInsightsALBSG.GroupId
+      Subnets:
+        - !Ref LocInsightsPublicSubnetA
+        - !Ref LocInsightsPublicSubnetB
+      Tags: [{Key: app, Value: locinsights}]
+
+  LocInsightsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: locinsights-web-tg
+      VpcId: !Ref LocInsightsVPC
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /login
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      Tags: [{Key: app, Value: locinsights}]
+
+  LocInsightsWebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LocInsightsALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: text/plain
+            MessageBody: Forbidden
+
+  LocInsightsWebListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref LocInsightsWebListener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-LocInsights-Origin
+            Values:
+              - !Ref OriginSecret
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref LocInsightsTargetGroup
+
+  # ---------------- CloudFront (app) ----------------
+  # NOTE: uses managed Managed-AllViewerExceptHostHeader origin request policy
+  # (b689b0a8-53d0-40ab-baf2-68738e2966ac). A custom whitelist policy strips the
+  # RSC / Next-Router-* headers, which forces Next.js App Router to fall back to
+  # full-page reloads on every <Link> navigation (chat widget state lost).
+
+  LocInsightsAppDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: locinsights-app-cdn
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: locinsights-alb-origin
+            DomainName: !GetAtt LocInsightsALB.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginCustomHeaders:
+              - HeaderName: X-LocInsights-Origin
+                HeaderValue: !Ref OriginSecret
+        DefaultCacheBehavior:
+          TargetOriginId: locinsights-alb-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+      Tags: [{Key: app, Value: locinsights}]
+
+  # ---------------- S3 + CloudFront (ML explorer) ----------------
+  LocInsightsMLBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub locinsights-ml-static-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags: [{Key: app, Value: locinsights}]
+
+  LocInsightsMLOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: locinsights-ml-oac
+        SigningProtocol: sigv4
+        SigningBehavior: always
+        OriginAccessControlOriginType: s3
+
+  LocInsightsMLDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: locinsights-ml-cdn
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        DefaultRootObject: index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: locinsights-ml-s3-origin
+            DomainName: !GetAtt LocInsightsMLBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt LocInsightsMLOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: locinsights-ml-s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+      Tags: [{Key: app, Value: locinsights}]
+
+  LocInsightsMLBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LocInsightsMLBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub ${LocInsightsMLBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${LocInsightsMLDistribution}
+
+Outputs:
+  AppURL:
+    Description: LocInsights web app (via CloudFront, HTTPS)
+    Value: !Sub https://${LocInsightsAppDistribution.DomainName}
+  MLURL:
+    Description: LocInsights ML explorer (via CloudFront, HTTPS)
+    Value: !Sub https://${LocInsightsMLDistribution.DomainName}
+  ALBDNS:
+    Description: Internal ALB DNS (origin - requires secret header)
+    Value: !GetAtt LocInsightsALB.DNSName
+  RDSEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt LocInsightsDB.Endpoint.Address
+  ECRRepo:
+    Description: ECR repository URI
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/locinsights/web
+  MLBucket:
+    Description: S3 bucket for ML static site
+    Value: !Ref LocInsightsMLBucket
+  ClusterName:
+    Value: locinsights-cluster
+  VPCId:
+    Value: !Ref LocInsightsVPC

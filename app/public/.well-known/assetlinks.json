@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "id.my.bayhaqy.locinsight",
+      "sha256_cert_fingerprints": [
+        "94:31:B2:1B:3E:60:C3:C4:A8:19:4A:16:3B:9B:DE:51:FD:8C:D6:0F:8C:1F:9F:52:A0:FF:F2:BB:30:A3:68:9C"
+      ]
+    }
+  }
+]
