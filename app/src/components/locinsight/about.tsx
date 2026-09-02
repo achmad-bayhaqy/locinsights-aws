@@ -202,11 +202,11 @@ export function About() {
               ]}
             />
             <DataSourceWithLink
-              title="CARTO Light Basemap"
-              desc="Vector tile basemap for visualization. Used in React-Leaflet for clean professional appearance."
+              title="OpenStreetMap Standard Basemap"
+              desc="Raster tile basemap for visualization. Used in React-Leaflet. No API key required; usage complies with the OSMF tile usage policy."
               type="Map Tiles"
               urls={[
-                { label: 'CARTO Basemaps', href: 'https://carto.com/basemaps/' },
+                { label: 'OpenStreetMap', href: 'https://www.openstreetmap.org/' },
                 { label: 'OSM Tile Usage Policy', href: 'https://operations.osmfoundation.org/policies/tiles/' },
               ]}
             />
