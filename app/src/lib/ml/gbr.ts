@@ -179,6 +179,15 @@ export interface GBRModel {
     r2: number
     mape: number
   }
+  /** Metrics measured ON THE TRAINING SET (in-sample) — kept for reference. */
+  training_metrics_train?: {
+    rmse: number
+    mae: number
+    r2: number
+    mape: number
+  }
+  /** Fraction of rows held out for honest (out-of-sample) evaluation. */
+  validation_split?: number
   trained_at: string
 }
 
@@ -189,6 +198,26 @@ export interface GBRTrainConfig {
   min_samples_split?: number
   subsample?: number
   noise_seed?: number
+  /**
+   * R2 fix — ML1 audit found metrics were computed on the TRAINING set
+   * (in-sample, optimistic). When validation_split > 0 (default 0.2 for
+   * datasets >= 40 rows), that fraction is HELD OUT: the model never sees it
+   * during training and all reported metrics are computed on it.
+   */
+  validation_split?: number
+}
+
+function regressionMetrics(y: number[], yHat: number[]): { rmse: number; mae: number; r2: number; mape: number } {
+  const n = y.length
+  const resid = y.map((yi, i) => yi - yHat[i])
+  const rmse = Math.sqrt(resid.reduce((s, r) => s + r * r, 0) / n)
+  const mae = resid.reduce((s, r) => s + Math.abs(r), 0) / n
+  const yMean = y.reduce((a, b) => a + b, 0) / n
+  const ssTot = y.reduce((s, yi) => s + (yi - yMean) ** 2, 0)
+  const ssRes = resid.reduce((s, r) => s + r * r, 0)
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0
+  const mape = y.reduce((s, yi, i) => yi !== 0 ? s + Math.abs((yi - yHat[i]) / yi) : s, 0) / n * 100
+  return { rmse, mae, r2, mape }
 }
 
 export function trainGBR(
@@ -196,7 +225,7 @@ export function trainGBR(
   y: number[],
   featureNames: string[],
   config: GBRTrainConfig = {},
-): { model: GBRModel; history: { iter: number; rmse: number }[] } {
+): { model: GBRModel; history: { iter: number; rmse: number; val_rmse?: number }[] } {
   const nEstimators = config.n_estimators ?? 80
   const maxDepth = config.max_depth ?? 3
   const lr = config.learning_rate ?? 0.1
@@ -207,10 +236,12 @@ export function trainGBR(
   if (X.length !== y.length) throw new Error('X and y must have same length')
   if (X.length === 0) throw new Error('Training data is empty')
 
-  const initPred = y.reduce((a, b) => a + b, 0) / y.length
-  const predictions = new Array(X.length).fill(initPred)
-  const trees: TreeNode[] = []
-  const history: { iter: number; rmse: number }[] = []
+  // ---- R2: honest holdout split (seeded shuffle, BEFORE training) ----
+  const requestedSplit = config.validation_split
+  const holdoutFrac = requestedSplit !== undefined
+    ? requestedSplit
+    : (X.length >= 40 ? 0.2 : 0) // sane default for small datasets
+  const useHoldout = holdoutFrac > 0 && holdoutFrac < 1 && X.length >= 20
 
   let rngState = seed
   const rand = () => {
@@ -218,49 +249,81 @@ export function trainGBR(
     return rngState / 0x80000000
   }
 
+  let trainIdx: number[]
+  let valIdx: number[]
+  if (useHoldout) {
+    const shuffled = X.map((_, i) => i)
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1))
+      ;[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]
+    }
+    const nVal = Math.max(5, Math.floor(X.length * holdoutFrac))
+    valIdx = shuffled.slice(0, nVal)
+    trainIdx = shuffled.slice(nVal)
+  } else {
+    trainIdx = X.map((_, i) => i)
+    valIdx = []
+  }
+
+  const Xtr = trainIdx.map(i => X[i])
+  const ytr = trainIdx.map(i => y[i])
+
+  const initPred = ytr.reduce((a, b) => a + b, 0) / ytr.length
+  const trainPreds = new Array(Xtr.length).fill(initPred)
+  const valPreds = valIdx.map(() => initPred)
+  const trees: TreeNode[] = []
+  const history: { iter: number; rmse: number; val_rmse?: number }[] = []
+
   for (let iter = 0; iter < nEstimators; iter++) {
-    const residuals = y.map((yi, i) => yi - predictions[i])
+    const residuals = ytr.map((yi, i) => yi - trainPreds[i])
 
     let sampleIdx: number[]
     if (subsample < 1.0) {
-      const n = Math.floor(X.length * subsample)
+      const n = Math.floor(Xtr.length * subsample)
       sampleIdx = []
       const used = new Set<number>()
       while (sampleIdx.length < n) {
-        const idx = Math.floor(rand() * X.length)
+        const idx = Math.floor(rand() * Xtr.length)
         if (!used.has(idx)) {
           used.add(idx)
           sampleIdx.push(idx)
         }
       }
     } else {
-      sampleIdx = X.map((_, i) => i)
+      sampleIdx = Xtr.map((_, i) => i)
     }
 
-    const subX = sampleIdx.map(i => X[i])
+    const subX = sampleIdx.map(i => Xtr[i])
     const subR = sampleIdx.map(i => residuals[i])
 
     const tree = buildTree(subX, subR, 0, maxDepth, minSamplesSplit)
     trees.push(tree)
 
-    for (let i = 0; i < X.length; i++) {
-      predictions[i] += lr * predictTree(tree, X[i])
+    for (let i = 0; i < Xtr.length; i++) {
+      trainPreds[i] += lr * predictTree(tree, Xtr[i])
+    }
+    for (let i = 0; i < valIdx.length; i++) {
+      valPreds[i] += lr * predictTree(tree, X[valIdx[i]])
     }
 
     const rmse = Math.sqrt(
-      y.reduce((s, yi, i) => s + (yi - predictions[i]) ** 2, 0) / y.length
+      ytr.reduce((s, yi, i) => s + (yi - trainPreds[i]) ** 2, 0) / ytr.length
     )
-    history.push({ iter: iter + 1, rmse })
+    const entry: { iter: number; rmse: number; val_rmse?: number } = { iter: iter + 1, rmse }
+    if (useHoldout) {
+      entry.val_rmse = Math.sqrt(
+        valIdx.reduce((s, vi, i) => s + (y[vi] - valPreds[i]) ** 2, 0) / valIdx.length
+      )
+    }
+    history.push(entry)
   }
 
-  const finalResid = y.map((yi, i) => yi - predictions[i])
-  const rmse = Math.sqrt(finalResid.reduce((s, r) => s + r * r, 0) / y.length)
-  const mae = finalResid.reduce((s, r) => s + Math.abs(r), 0) / y.length
-  const yMean = y.reduce((a, b) => a + b, 0) / y.length
-  const ssTot = y.reduce((s, yi) => s + (yi - yMean) ** 2, 0)
-  const ssRes = finalResid.reduce((s, r) => s + r * r, 0)
-  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0
-  const mape = y.reduce((s, yi, i) => yi !== 0 ? s + Math.abs((yi - predictions[i]) / yi) : s, 0) / y.length * 100
+  // ---- Honest metrics: on HOLDOUT when available, in-sample otherwise ----
+  const inSample = regressionMetrics(ytr, trainPreds)
+  let reported = inSample
+  if (useHoldout) {
+    reported = regressionMetrics(valIdx.map(i => y[i]), valPreds)
+  }
 
   const model: GBRModel = {
     version: 'gbr-v1',
@@ -270,7 +333,9 @@ export function trainGBR(
     max_depth: maxDepth,
     n_estimators: nEstimators,
     trees,
-    training_metrics: { rmse, mae, r2, mape },
+    training_metrics: reported,
+    ...(useHoldout ? { training_metrics_train: inSample } : {}),
+    ...(useHoldout ? { validation_split: holdoutFrac } : {}),
     trained_at: new Date().toISOString(),
   }
 

@@ -22,9 +22,10 @@ import { db, handleError } from '@/lib/api-helpers'
 import { requirePermission } from '@/lib/auth-server'
 import { setTenantContext, tenantFilter } from '@/lib/tenant-context'
 import { scoreAllKelurahan, getTopOpportunities } from '@/lib/scoring/engine'
-import { predictGBR, computeFeatureImportance, type GBRModel } from '@/lib/ml/gbr'
-import { buildFeatureVector } from '@/lib/ml/dataset'
+import { computeFeatureImportance, type GBRModel } from '@/lib/ml/gbr'
 import { getTrainedModel } from '@/lib/ml/model-cache'
+import { predictAndPersist, loadBestModel } from '@/lib/ml/predict-service'
+import { buildScoringConfig, loadKelurahanFromDB } from '@/lib/scoring/db-engine'
 import { promises as fs } from 'fs'
 import path from 'path'
 
@@ -181,32 +182,18 @@ export async function GET(req: NextRequest) {
       if (!kelurahanId) {
         return NextResponse.json({ success: false, error: 'kelurahan_id is required' }, { status: 400 })
       }
-      const model = await loadModel()
-      if (!model) {
-        return NextResponse.json({
-          success: false,
-          error: 'GBR model not yet trained. POST to /api/locinsight/ml/train to train.',
-        }, { status: 404 })
+      // R1a/R1b/R1c: DB-backed feature vector + model loader (memory → DB
+      // artifact → bundled JSON) + persist to `predictions` for ground truth.
+      const tenantWhere = tenantFilter(auth.session)
+      const tenantId = (tenantWhere as { tenant_id?: string }).tenant_id ?? null
+      const result = await predictAndPersist(kelurahanId, brandId, { tenantId })
+      if (!result.ok) {
+        const message = result.reason === 'no_model'
+          ? 'GBR model not yet trained. POST to /api/locinsight/ml/train to train.'
+          : 'Could not build feature vector'
+        return NextResponse.json({ success: false, error: message }, { status: 404 })
       }
-      const fv = buildFeatureVector(kelurahanId, brandId)
-      if (!fv) {
-        return NextResponse.json({ success: false, error: 'Could not build feature vector' }, { status: 404 })
-      }
-      const { prediction, contributions } = predictGBR(model, fv.X)
-      // Confidence = 1 - normalized prediction variance (proxy: training R²)
-      const r2 = model.training_metrics?.r2 ?? 0.5
-      const confidence = Math.max(0.3, Math.min(0.95, r2))
-      return NextResponse.json({
-        success: true,
-        data: {
-          model_name: model.version,
-          model_version: `v1.0 (${model.n_estimators} trees, depth ${model.max_depth})`,
-          predicted_revenue_juta: Math.max(0, Math.round(prediction)),
-          confidence: Math.round(confidence * 100) / 100,
-          brand_used: fv.brand_name,
-          top_features: contributions.slice(0, 5),
-        },
-      })
+      return NextResponse.json({ success: true, data: result.data })
     }
 
     if (action === 'feature_importance') {
@@ -259,22 +246,25 @@ export async function GET(req: NextRequest) {
 
     if (action === 'predictions') {
       const limit = Math.min(200, Number(sp.get('limit') || 50))
-      const opps = getTopOpportunities(limit)
+      // R1b: score the FULL DB kelurahan list (2173, incl. Jabodetabek) —
+      // mirrors the opportunities API — instead of the static Bali set.
+      const kelurahanList = await loadKelurahanFromDB()
+      const config = await buildScoringConfig({ kelurahanList, brand_id: sp.get('brand_id') || undefined })
+      const opps = getTopOpportunities(limit, config)
 
-      // If ML model is available, replace heuristic revenue with ML prediction
-      const model = await loadModel()
+      const model = await loadBestModel()
       const predictions: any[] = []
       for (const o of opps) {
         let mlRevenue = o.projected_monthly_revenue_juta
         let mlConfidence = Math.min(0.95, 0.5 + o.composite_score / 200)
         let mlFeatures: { feature: string; contribution: number }[] = []
         if (model) {
-          const fv = buildFeatureVector(o.kelurahan_id)
-          if (fv) {
-            const { prediction, contributions } = predictGBR(model, fv.X)
-            mlRevenue = Math.max(0, Math.round(prediction))
-            mlConfidence = Math.max(0.3, Math.min(0.95, model.training_metrics?.r2 ?? 0.5))
-            mlFeatures = contributions.slice(0, 3)
+          // persist:false — listing endpoint, do NOT flood the predictions table
+          const r = await predictAndPersist(o.kelurahan_id, undefined, { persist: false, tenantId: (tenantFilter(auth.session) as { tenant_id?: string }).tenant_id ?? null })
+          if (r.ok && r.data) {
+            mlRevenue = r.data.predicted_revenue_juta
+            mlConfidence = r.data.confidence
+            mlFeatures = r.data.top_features.slice(0, 3)
           }
         }
         predictions.push({
@@ -367,7 +357,126 @@ export async function GET(req: NextRequest) {
       })
     }
 
+    if (action === 'drift') {
+      // R5 — drift & health report for the AgentCore agent (and dashboards):
+      //   1. Ground-truth accuracy: MAPE/bias over predictions that have
+      //      actual_revenue recorded (R4 flywheel).
+      //   2. Prediction coverage: persisted predictions vs kelurahan count.
+      //   3. Data freshness: latest sync watermark from sync_state.
+      const withActual = await db.prediction.findMany({
+        where: { actual_revenue: { not: null }, OR: [{ tenant_id: null }, tenantFilter(auth.session)] },
+        orderBy: { created_at: 'desc' },
+        take: 200,
+        select: { prediction: true, actual_revenue: true, actual_recorded_at: true, target_id: true, target_name: true, created_at: true },
+      })
+      const errors = withActual
+        .filter(r => Number(r.actual_revenue) > 0)
+        .map(r => ({
+          target_id: r.target_id,
+          target_name: r.target_name,
+          predicted: Number(r.prediction),
+          actual: Number(r.actual_revenue),
+          ape_pct: Math.abs(Number(r.actual_revenue) - Number(r.prediction)) / Number(r.actual_revenue) * 100,
+        }))
+      const mape = errors.length > 0 ? errors.reduce((s, e) => s + e.ape_pct, 0) / errors.length : null
+      const bias = errors.length > 0
+        ? errors.reduce((s, e) => s + (e.predicted - e.actual), 0) / errors.length
+        : null
+
+      const [totalPredictions, kelurahanCount, lastSync] = await Promise.all([
+        db.prediction.count({ where: { OR: [{ tenant_id: null }, tenantFilter(auth.session)] } }),
+        db.kelurahan.count().catch(() => 0),
+        db.$queryRawUnsafe<any[]>(`SELECT key, value FROM sync_state ORDER BY key LIMIT 10`).catch(() => [] as any[]),
+      ])
+
+      return NextResponse.json({
+        success: true,
+        data: {
+          ground_truth: {
+            samples: errors.length,
+            mape_pct: mape !== null ? Math.round(mape * 10) / 10 : null,
+            bias_juta: bias !== null ? Math.round(bias * 10) / 10 : null,
+            verdict: errors.length < 10
+              ? 'insufficient_ground_truth (need >= 10 actuals to measure drift)'
+              : mape !== null && mape <= 30 ? 'healthy' : 'drift_detected — retrain recommended',
+            latest: errors.slice(0, 10),
+          },
+          coverage: {
+            persisted_predictions: totalPredictions,
+            kelurahan_in_db: kelurahanCount,
+          },
+          data_freshness: lastSync,
+          model: (await loadBestModel()) ? {
+            version: (await loadBestModel())!.version,
+            trained_at: (await loadBestModel())!.trained_at,
+            holdout_metrics: (await loadBestModel())!.training_metrics ?? null,
+          } : null,
+          checked_at: new Date().toISOString(),
+        },
+      })
+    }
+
     return NextResponse.json({ success: false, error: 'Unknown action' }, { status: 400 })
+  } catch (e) {
+    return handleError(e)
+  }
+}
+
+/**
+ * R4 — ground-truth feedback endpoint.
+ *
+ * POST /api/locinsight/ml
+ *   body: { prediction_id, actual_revenue (juta IDR), note? }
+ *
+ * Records the OBSERVED monthly revenue for a persisted prediction so future
+ * drift checks (action=drift) and retraining runs can learn from reality
+ * instead of the synthetic heuristic targets. Designed to be called by the
+ * Ops team and by the AgentCore agent (ground-truth capture tool).
+ */
+export async function POST(req: NextRequest) {
+  const auth = await requirePermission('ml', 'update')
+  if (!auth.ok) return auth.response
+  await setTenantContext(auth.session)
+
+  try {
+    const body = await req.json().catch(() => ({}))
+    const predictionId = String(body.prediction_id || '')
+    const actualRevenue = Number(body.actual_revenue)
+    if (!predictionId || !Number.isFinite(actualRevenue) || actualRevenue < 0) {
+      return NextResponse.json(
+        { success: false, error: 'prediction_id (string) and actual_revenue (non-negative number, juta IDR) are required' },
+        { status: 400 },
+      )
+    }
+
+    const existing = await db.prediction.findUnique({
+      where: { id: predictionId },
+      select: { id: true, prediction: true, target_name: true, tenant_id: true },
+    })
+    if (!existing) {
+      return NextResponse.json({ success: false, error: `prediction ${predictionId} not found` }, { status: 404 })
+    }
+
+    const updated = await db.prediction.update({
+      where: { id: predictionId },
+      data: {
+        actual_revenue: actualRevenue,
+        actual_recorded_at: new Date(),
+        decision_note: body.note ? String(body.note).slice(0, 500) : null,
+      },
+      select: { id: true, target_id: true, target_name: true, prediction: true, actual_revenue: true, actual_recorded_at: true, decision_note: true },
+    })
+
+    const ape = Number(existing.prediction) > 0 && actualRevenue > 0
+      ? Math.round(Math.abs(actualRevenue - Number(existing.prediction)) / actualRevenue * 1000) / 10
+      : null
+
+    return NextResponse.json({
+      success: true,
+      data: updated,
+      accuracy: ape !== null ? { absolute_percentage_error_pct: ape } : null,
+      note: 'Ground truth recorded. Run GET /api/locinsight/ml?action=drift to see model health.',
+    })
   } catch (e) {
     return handleError(e)
   }

@@ -370,6 +370,11 @@ model Prediction {
   confidence    Float?                    @default(0)
   explanation   Json?                     @default("{}")
   is_blank_spot Boolean?                  @default(false)
+  /// R4 ground-truth flywheel: observed monthly revenue (juta IDR) after the
+  /// store opens — captured via POST /api/locinsight/ml (feedback) or agent
+  actual_revenue     Float?
+  actual_recorded_at DateTime?             @db.Timestamptz(6)
+  decision_note      String?
   created_at    DateTime                  @default(now()) @db.Timestamptz(6)
   ml_models     MLModel                 @relation(fields: [model_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
   tenant_id           String?
@@ -607,6 +612,8 @@ model TrainingRun {
   metrics            Json?                 @default("{}")
   feature_importance Json?                 @default("[]")
   model_artifact_url String?
+  /// R2: full serialized GBR model JSON (survives cold starts; loaded by predict-service)
+  model_artifact     Json?
   train_duration_ms  Int?
   error              String?
   started_at         DateTime              @default(now()) @db.Timestamptz(6)

@@ -19,6 +19,7 @@
  * GET /api/locinsight/ml/train — list previous training runs
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db'
 import { trainGBR, computeFeatureImportance, type GBRModel } from '@/lib/ml/gbr'
 import { buildTrainingDataset, FEATURE_NAMES } from '@/lib/ml/dataset'
@@ -64,7 +65,8 @@ export async function POST(req: NextRequest) {
     const X = rows.map(r => r.X)
     const y = rows.map(r => r.y)
 
-    // Train
+    // Train — R2: honest holdout metrics (validation_split defaults to 0.2
+    // for datasets >= 40 rows inside trainGBR)
     const { model, history } = trainGBR(X, y, [...FEATURE_NAMES], config)
     const featureImportance = computeFeatureImportance(model)
 
@@ -112,6 +114,9 @@ export async function POST(req: NextRequest) {
 
     // STEP 2: Now safe to create the TrainingRun child row (FK satisfied).
     // Inject tenant_id so each tenant's training history is isolated.
+    // R2: the full model artifact is persisted to the DB (model_artifact
+    // JSONB) so inference survives cold starts — previously the freshly
+    // trained model lived only in-memory for 15 minutes (ML1 finding).
     const trainingRun = await prisma.trainingRun.create({
       data: withTenantId(authSession, {
         model_id,
@@ -127,15 +132,27 @@ export async function POST(req: NextRequest) {
           min_samples_split: config.min_samples_split,
           subsample: config.subsample,
           noise_seed: config.noise_seed,
+          validation_split: model.validation_split ?? 0,
         }),
-        metrics: JSON.stringify(model.training_metrics),
+        metrics: JSON.stringify({
+          ...(model.training_metrics ?? {}),
+          evaluation: model.validation_split ? 'holdout' : 'in_sample',
+          ...(model.training_metrics_train ? { in_sample: model.training_metrics_train } : {}),
+        }),
         feature_importance: JSON.stringify(featureImportance),
+        model_artifact: model as unknown as Prisma.InputJsonValue,
         // Mark as in-memory since Vercel FS is read-only
         model_artifact_url: 'in-memory://gbr-revenue-bali-v1',
         train_duration_ms: trainDuration,
         finished_at: new Date(),
       }),
     })
+
+    // R2: stamp the artifact URL to point at the DB copy now that run id exists
+    await prisma.trainingRun.update({
+      where: { id: trainingRun.id },
+      data: { model_artifact_url: `db://training_runs/${trainingRun.id}` },
+    }).catch(() => {/* cosmetic */})
 
     // Update MLModel version stamp with the run id (cosmetic)
     await prisma.mLModel.update({

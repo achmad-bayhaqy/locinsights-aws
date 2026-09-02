@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { scoreKelurahan, type ScoringConfig, type CompetitorStoreLite } from '@/lib/scoring/engine'
-import { approxTravelTimeMin } from '@/lib/scoring/engine'
 import { getKelurahan, haversineKm } from '@/lib/data/bali-kelurahan'
 import { BALI_STORES } from '@/lib/data/bali-stores'
 import { BALI_MALLS } from '@/lib/data/bali-malls'
 import { BALI_POIS } from '@/lib/data/bali-poi'
 import { prisma } from '@/lib/db'
-import { getKelurahanFromDB, loadStoresFromDB } from '@/lib/scoring/db-engine'
+import { getKelurahanFromDB } from '@/lib/scoring/db-engine'
 import { requirePermission } from '@/lib/auth-server'
 import { setTenantContext, tenantFilter } from '@/lib/tenant-context'
+import { predictAndPersist } from '@/lib/ml/predict-service'
 
 export const dynamic = 'force-dynamic'
 
@@ -58,50 +58,34 @@ export async function GET(req: NextRequest) {
   const config: ScoringConfig = { brand_id: brandId, competitorStores, useTravelTime: true }
   const score = scoreKelurahan(kel, config)
 
-  // Nearby MAP stores (within 5km)
-  const nearbyStores = BALI_STORES
-    .map(s => ({ ...s, distance_km: haversineKm(kel.lat, kel.lng, s.lat, s.lng) }))
-    .filter(s => s.distance_km <= 5)
-    .sort((a, b) => a.distance_km - b.distance_km)
+  // Resolve tenant id for tenant-scoped raw SQL (superadmin platform-wide → null)
+  const tenantWhere = tenantFilter(auth.session)
+  const tenantId = (tenantWhere as { tenant_id?: string }).tenant_id ?? null
 
-  // Nearby competitor stores (within 5km, Phase 2)
-  const nearbyCompetitors = competitorRows
-    .map(c => ({ ...c, distance_km: haversineKm(kel.lat, kel.lng, c.lat, c.lng) }))
-    .filter(c => c.distance_km <= 5)
-    .sort((a, b) => a.distance_km - b.distance_km)
-
-  // Nearby malls (within 10km)
-  const nearbyMalls = BALI_MALLS
-    .map(m => ({ ...m, distance_km: haversineKm(kel.lat, kel.lng, m.lat, m.lng) }))
-    .filter(m => m.distance_km <= 10)
-    .sort((a, b) => a.distance_km - b.distance_km)
-
-  // Nearby POIs (within 10km)
-  const nearbyPOIs = BALI_POIS
-    .map(p => ({ ...p, distance_km: haversineKm(kel.lat, kel.lng, p.lat, p.lng) }))
-    .filter(p => p.distance_km <= 10)
-    .sort((a, b) => a.distance_km - b.distance_km)
+  // R3: nearby lists via PostGIS ST_DWithin pushdown (GiST-indexed) — works
+  // for ALL provinces in the DB (2173 kelurahan), not only the static Bali set.
+  // Static fallbacks are kept for resilience if the DB is unreachable.
+  const [nearbyStores, nearbyCompetitors, nearbyMalls, nearbyPOIs] = await loadNearbyViaPostGIS(
+    kel.lat, kel.lng, tenantId,
+  )
 
   // Phase 2: Travel-time isochrone polygon (approximation)
   // Generate 36-point polygon at N-minute drive from kelurahan centroid.
   // Road network friction derived from urban_index + tier.
   const isochrones = buildIsochrones(kel.lat, kel.lng, kel.tier, kel.urban_index)
 
-  // Phase 3: ML revenue prediction (if model exists)
-  let mlPrediction: { model_name: string; predicted_revenue_juta: number; confidence: number; top_features: { feature: string; contribution: number }[] } | null = null
-  try {
-    const mlResp = await fetch(`${req.nextUrl.origin}/api/locinsight/ml?action=predict_revenue&kelurahan_id=${kelurahanId}${brandId ? `&brand_id=${brandId}` : ''}`, {
-      // avoid external HTTP call in dev
-      // @ts-ignore
-      next: { revalidate: 0 },
-    })
-    if (mlResp.ok) {
-      const mlJson = await mlResp.json()
-      if (mlJson.success) mlPrediction = mlJson.data
-    }
-  } catch {
-    // swallow — ML prediction is optional
-  }
+  // Phase 3: ML revenue prediction — R1a fix: direct in-process call instead
+  // of a cookie-less self-fetch (which 401'd and silently null'd ml_prediction
+  // in production). Also persists the prediction (R1c) for ground-truth (R4).
+  const ml = await predictAndPersist(kelurahanId, brandId, { tenantId })
+  const mlPrediction = ml.ok
+    ? {
+        model_name: ml.data!.model_name,
+        predicted_revenue_juta: ml.data!.predicted_revenue_juta,
+        confidence: ml.data!.confidence,
+        top_features: ml.data!.top_features,
+      }
+    : null
 
   return NextResponse.json({
     success: true,
@@ -150,4 +134,103 @@ function buildIsochrones(lat: number, lng: number, tier: 1 | 2 | 3, urbanIndex: 
     }
     return { minutes: min, mode: 'motorbike', points }
   })
+}
+
+/**
+ * R3 — nearby stores / competitors / malls / POIs computed IN POSTGRES with
+ * ST_DWithin + ST_Distance on the GiST-indexed geography columns. Replaces
+ * the previous O(n) Haversine loops over static Bali-only arrays, so nearby
+ * lists now work for Jabodetabek and all 38 provinces. Each list falls back
+ * to the static computation when the DB returns nothing (resilience).
+ */
+async function loadNearbyViaPostGIS(
+  lat: number, lng: number, tenantId: string | null,
+): Promise<[any[], any[], any[], any[]]> {
+  const point = `ST_SetSRID(ST_MakePoint(${Number(lng)}, ${Number(lat)}), 4326)::geography`
+  const tenantClause = tenantId ? `AND tenant_id = '${tenantId.replace(/'/g, "''")}'` : ''
+
+  try {
+    const storesQ = prisma.$queryRawUnsafe<any[]>(`
+      SELECT id, brand_id, brand_name, brand_category::text AS brand_category,
+             parent::text AS parent, name, lat, lng, kec, kab,
+             COALESCE(is_in_mall, false) AS is_in_mall, mall_id, mall_name,
+             COALESCE(address, '') AS address, COALESCE(opened_year, 0) AS opened_year,
+             COALESCE(confirmed, false) AS confirmed,
+             ST_Distance(geom, ${point}) / 1000.0 AS distance_km
+      FROM stores
+      WHERE ST_DWithin(geom, ${point}, 5000) ${tenantClause}
+      ORDER BY geom <-> ${point}
+      LIMIT 25`)
+    const competitorsQ = prisma.$queryRawUnsafe<any[]>(`
+      SELECT id, brand_name, brand_category::text AS brand_category, name,
+             lat, lng, mall_name,
+             ST_Distance(geom, ${point}) / 1000.0 AS distance_km
+      FROM competitor_stores
+      WHERE ST_DWithin(geom, ${point}, 5000) ${tenantClause}
+      ORDER BY geom <-> ${point}
+      LIMIT 25`)
+    const mallsQ = prisma.$queryRawUnsafe<any[]>(`
+      SELECT id, name, lat, lng, kec, kab, COALESCE(gla_m2, 0) AS gla_m2,
+             COALESCE(opened_year, 0) AS opened_year, class::text AS class,
+             COALESCE(visitor_estimate_daily, 0) AS visitor_estimate_daily,
+             ST_Distance(geom, ${point}) / 1000.0 AS distance_km
+      FROM malls
+      WHERE ST_DWithin(geom, ${point}, 10000) ${tenantClause}
+      ORDER BY geom <-> ${point}
+      LIMIT 25`)
+    const poisQ = prisma.$queryRawUnsafe<any[]>(`
+      SELECT id, name, type::text AS type, lat, lng, kec, kab,
+             COALESCE(magnitude, 0) AS magnitude, COALESCE(notes, '') AS notes,
+             ST_Distance(geom, ${point}) / 1000.0 AS distance_km
+      FROM pois
+      WHERE ST_DWithin(geom, ${point}, 10000) ${tenantClause}
+      ORDER BY geom <-> ${point}
+      LIMIT 25`)
+
+    const [dbStores, dbCompetitors, dbMalls, dbPois] = await Promise.all([storesQ, competitorsQ, mallsQ, poisQ])
+
+    const roundKm = (r: any) => ({ ...r, distance_km: Math.round(Number(r.distance_km) * 100) / 100 })
+
+    const stores = dbStores.length > 0
+      ? dbStores.map(roundKm)
+      : BALI_STORES
+          .map(s => ({ ...s, distance_km: haversineKm(lat, lng, s.lat, s.lng) }))
+          .filter(s => s.distance_km <= 5)
+          .sort((a, b) => a.distance_km - b.distance_km)
+
+    const competitors = dbCompetitors.length > 0
+      ? dbCompetitors.map(roundKm)
+      : [] // competitor fallback requires the earlier DB fetch; empty is fine
+
+    const malls = dbMalls.length > 0
+      ? dbMalls.map(roundKm)
+      : BALI_MALLS
+          .map(m => ({ ...m, distance_km: haversineKm(lat, lng, m.lat, m.lng) }))
+          .filter(m => m.distance_km <= 10)
+          .sort((a, b) => a.distance_km - b.distance_km)
+
+    const pois = dbPois.length > 0
+      ? dbPois.map(roundKm)
+      : BALI_POIS
+          .map(p => ({ ...p, distance_km: haversineKm(lat, lng, p.lat, p.lng) }))
+          .filter(p => p.distance_km <= 10)
+          .sort((a, b) => a.distance_km - b.distance_km)
+
+    return [stores, competitors, malls, pois]
+  } catch {
+    // PostGIS unavailable → legacy static behavior
+    const stores = BALI_STORES
+      .map(s => ({ ...s, distance_km: haversineKm(lat, lng, s.lat, s.lng) }))
+      .filter(s => s.distance_km <= 5)
+      .sort((a, b) => a.distance_km - b.distance_km)
+    const malls = BALI_MALLS
+      .map(m => ({ ...m, distance_km: haversineKm(lat, lng, m.lat, m.lng) }))
+      .filter(m => m.distance_km <= 10)
+      .sort((a, b) => a.distance_km - b.distance_km)
+    const pois = BALI_POIS
+      .map(p => ({ ...p, distance_km: haversineKm(lat, lng, p.lat, p.lng) }))
+      .filter(p => p.distance_km <= 10)
+      .sort((a, b) => a.distance_km - b.distance_km)
+    return [stores, [], malls, pois]
+  }
 }
