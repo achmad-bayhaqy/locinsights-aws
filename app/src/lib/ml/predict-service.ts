@@ -33,6 +33,9 @@ const MODEL_PATH = path.join(process.cwd(), 'prisma', 'ml-models', 'gbr-revenue-
 let dbArtifactCache: { model: GBRModel; loadedAt: number } | null = null
 const DB_ARTIFACT_TTL_MS = 120_000 // 2 min
 
+/** Module-level flag: parent MLModel row existence is checked once per process. */
+let parentModelEnsured = false
+
 async function loadBundledModel(): Promise<GBRModel | null> {
   try {
     const raw = await fs.readFile(MODEL_PATH, 'utf-8')
@@ -116,6 +119,32 @@ export async function predictAndPersist(
   let persisted = false
   if (persist) {
     try {
+      // FK requires the parent MLModel row — ensure it exists (idempotent,
+      // cached after first success so we don't upsert on every request)
+      if (!parentModelEnsured) {
+        await prisma.mLModel.upsert({
+          where: { id: 'mdl_gbr_revenue_v1' },
+          create: {
+            id: 'mdl_gbr_revenue_v1',
+            name: 'GBR Revenue Predictor v1',
+            version: model.version,
+            type: 'revenue_forecast',
+            algorithm: 'gbr_regressor',
+            description: `GBR revenue predictor (auto-ensured by predict-service). Trained ${model.trained_at}.`,
+            features: JSON.stringify(model.feature_names),
+            hyperparameters: JSON.stringify({
+              n_estimators: model.n_estimators,
+              max_depth: model.max_depth,
+              learning_rate: model.learning_rate,
+            }),
+            metrics: JSON.stringify(model.training_metrics ?? {}),
+            status: 'active',
+            trained_at: new Date(),
+          },
+          update: {},
+        })
+        parentModelEnsured = true
+      }
       await prisma.prediction.create({
         data: {
           model_id: 'mdl_gbr_revenue_v1',
@@ -138,8 +167,9 @@ export async function predictAndPersist(
         },
       })
       persisted = true
-    } catch {
+    } catch (e) {
       // Persistence is best-effort — never fail the prediction itself
+      console.error('[predict-service] persist failed:', e?.message || e)
       persisted = false
     }
   }

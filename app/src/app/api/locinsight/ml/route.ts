@@ -389,6 +389,8 @@ export async function GET(req: NextRequest) {
         db.$queryRawUnsafe<any[]>(`SELECT key, value FROM sync_state ORDER BY key LIMIT 10`).catch(() => [] as any[]),
       ])
 
+      const bestModel = await loadBestModel()
+
       return NextResponse.json({
         success: true,
         data: {
@@ -406,10 +408,10 @@ export async function GET(req: NextRequest) {
             kelurahan_in_db: kelurahanCount,
           },
           data_freshness: lastSync,
-          model: (await loadBestModel()) ? {
-            version: (await loadBestModel())!.version,
-            trained_at: (await loadBestModel())!.trained_at,
-            holdout_metrics: (await loadBestModel())!.training_metrics ?? null,
+          model: bestModel ? {
+            version: bestModel.version,
+            trained_at: bestModel.trained_at,
+            holdout_metrics: bestModel.training_metrics ?? null,
           } : null,
           checked_at: new Date().toISOString(),
         },
