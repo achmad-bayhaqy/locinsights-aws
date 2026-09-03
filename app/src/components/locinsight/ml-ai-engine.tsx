@@ -230,7 +230,7 @@ export function MLAIEngine() {
                           </div>
                         </div>
                         <div className="text-right text-[10px] text-[var(--brand-ink)]/50">
-                          {t('ml.trained_label')} {new Date(m.trained_at).toLocaleDateString()}
+                          {m.trained_at ? `${t('ml.trained_label')} ${new Date(m.trained_at).toLocaleDateString()}` : `${t('ml.trained_label')} —`}
                         </div>
                       </div>
                       <p className="text-[12px] text-[var(--brand-ink)]/80 leading-relaxed">{m.description}</p>

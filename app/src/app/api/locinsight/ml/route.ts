@@ -145,15 +145,21 @@ export async function GET(req: NextRequest) {
       })
 
       if (latestRun) {
+        // Version: prefer the ARTIFACT's version (set by ml-retrain/train route,
+        // e.g. 'gbr-v1-db') over a hash of the run id — the old hash changed on
+        // every GET and clobbered the meaningful artifact version.
+        const servingModel = await loadBestModel()
+        const modelVersion = servingModel?.version || `v1.${latestRun.id.slice(-4)}`
+        const description = `Real gradient-boosted regression (Friedman 2001) — pure TypeScript. Trained on ${latestRun.dataset_size} (kelurahan × brand) DB-backed samples${(latestRun.metrics as any)?.ground_truth_samples ? ` incl. ${(latestRun.metrics as any).ground_truth_samples} real actuals` : ''}, 80/20 holdout. Replaces the heuristic revenue projection with a learned model.`
         await db.mLModel.upsert({
           where: { id: 'mdl_gbr_revenue_v1' },
           create: {
             id: 'mdl_gbr_revenue_v1',
             name: 'GBR Revenue Predictor',
-            version: `v1.${latestRun.id.slice(-4)}`,
+            version: modelVersion,
             type: 'revenue_forecast' as any,
             algorithm: 'gbr_regressor' as any,
-            description: `Real gradient-boosted regression (Friedman 2001) — pure TypeScript. Trained on ${latestRun.dataset_size} (kelurahan × brand) synthetic samples. Replaces the heuristic revenue projection with learned model.`,
+            description,
             features: latestRun.features as any,
             hyperparameters: latestRun.hyperparameters as any,
             metrics: latestRun.metrics as any,
@@ -161,8 +167,8 @@ export async function GET(req: NextRequest) {
             trained_at: latestRun.started_at,
           },
           update: {
-            version: `v1.${latestRun.id.slice(-4)}`,
-            description: `Real gradient-boosted regression (Friedman 2001) — pure TypeScript. Trained on ${latestRun.dataset_size} (kelurahan × brand) synthetic samples. Replaces the heuristic revenue projection with learned model.`,
+            version: modelVersion,
+            description,
             features: latestRun.features as any,
             hyperparameters: latestRun.hyperparameters as any,
             metrics: latestRun.metrics as any,
