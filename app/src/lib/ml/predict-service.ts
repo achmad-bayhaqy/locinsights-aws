@@ -167,7 +167,7 @@ export async function predictAndPersist(
         },
       })
       persisted = true
-    } catch (e) {
+    } catch (e: any) {
       // Persistence is best-effort — never fail the prediction itself
       console.error('[predict-service] persist failed:', e?.message || e)
       persisted = false
