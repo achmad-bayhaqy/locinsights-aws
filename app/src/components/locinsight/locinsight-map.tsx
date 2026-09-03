@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   MapContainer,
   TileLayer,
@@ -319,9 +319,35 @@ export function LocInsightMap({
   const [geoError, setGeoError] = useState<string | null>(null)
   const selected = opportunities.find(o => o.kelurahan_id === selectedKelurahanId)
 
-  // Bali center: roughly -8.4, 115.2
-  const center: [number, number] = [-8.45, 115.2]
-  const initialZoom = 10
+  // Initial center — user location on first open (if granted), else a
+  // country-aware default (Jakarta/Indonesia; no longer hardcoded Bali).
+  // Once the user picks a location/province, map-explorer flies via FlyTo.
+  const DEFAULT_CENTER: [number, number] = [-6.2, 106.816]   // Jakarta
+  const center: [number, number] = userLocation
+    ? [userLocation.lat, userLocation.lng]
+    : DEFAULT_CENTER
+  const initialZoom = userLocation ? 12 : 9
+
+  // Auto-request the browser location the first time the map is opened
+  // (per user request). The explicit recenter button can retry anytime.
+  const didAutoLocate = useRef(false)
+  useEffect(() => {
+    if (didAutoLocate.current) return
+    didAutoLocate.current = true
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setUserLocation({
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: pos.coords.accuracy || 50,
+          })
+        },
+        () => { /* silent: keep default center when permission denied */ },
+        { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 },
+      )
+    }
+  }, [])
 
   const filteredOpps = useMemo(() => {
     return opportunities.filter(o => {

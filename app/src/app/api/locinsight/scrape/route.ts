@@ -33,15 +33,23 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 export async function POST(req: NextRequest) {
-  const auth = await requireSuperadmin()
-  if (!auth.ok) return auth.response
-
+  // NOTE: the whole handler is wrapped — an uncaught throw here would let
+  // Next.js answer with a non-JSON error page (Task 10-a: every scraper error
+  // must be JSON with a correct status code).
   try {
-    const auth = await requirePermission('scraper', 'create')
+    const auth = await requireSuperadmin()
     if (!auth.ok) return auth.response
-    await setTenantContext(auth.session)
 
-    const body = await req.json()
+    const auth2 = await requirePermission('scraper', 'create')
+    if (!auth2.ok) return auth2.response
+    await setTenantContext(auth2.session)
+
+    let body: any
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ success: false, error: 'Invalid JSON body' }, { status: 400 })
+    }
     const mode: ScrapeMode = body.mode === 'brand' ? 'brand' : 'keyword'
     const kinds: ItemKind[] | undefined = Array.isArray(body.kinds)
       ? body.kinds.filter((k: string) => k === 'store' || k === 'mall' || k === 'poi')
@@ -63,7 +71,7 @@ export async function POST(req: NextRequest) {
 
     // Log scraper run for audit (tenant-scoped)
     const run = await db.scraperRun.create({
-      data: withTenantId(auth.session, {
+      data: withTenantId(auth2.session, {
         query: mode === 'keyword' ? (scrapeReq.query || '') : `brand sweep: ${(result.meta.brands_scraped || []).join(', ')}`,
         source: result.source as any,
         status: 'success',
@@ -95,18 +103,18 @@ export async function POST(req: NextRequest) {
  * GET /api/locinsight/scrape — list previous scraper runs
  */
 export async function GET(req: NextRequest) {
-  const auth = await requireAuth()
-  if (!auth.ok) return auth.response
-
   try {
-    const auth = await requirePermission('scraper', 'read')
+    const auth = await requireAuth()
     if (!auth.ok) return auth.response
-    await setTenantContext(auth.session)
+
+    const auth2 = await requirePermission('scraper', 'read')
+    if (!auth2.ok) return auth2.response
+    await setTenantContext(auth2.session)
 
     const sp = req.nextUrl.searchParams
     const limit = Math.min(100, Number(sp.get('limit') || 50))
     const runs = await db.scraperRun.findMany({
-      where: tenantFilter(auth.session),
+      where: tenantFilter(auth2.session),
       orderBy: { started_at: 'desc' },
       take: limit,
     })

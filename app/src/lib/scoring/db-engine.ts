@@ -229,3 +229,94 @@ export async function getKelurahanFromDB(id: string): Promise<Kelurahan | null> 
     is_coastal: Boolean(row.is_coastal),
   }
 }
+
+// ===== Malls / POIs / Brands loaders (DB = source of truth, not Bali-only) =====
+
+let mallsCache: any[] | null = null
+let mallsCacheTime = 0
+const MALLS_CACHE_TTL_MS = 60_000
+
+/** Load ALL malls from the DB (shape-compatible with the static BALI_MALLS usage). */
+export async function loadMallsFromDB(): Promise<any[]> {
+  const now = Date.now()
+  if (mallsCache && (now - mallsCacheTime) < MALLS_CACHE_TTL_MS) return mallsCache
+  const rows = await prisma.mall.findMany({
+    select: {
+      id: true, name: true, lat: true, lng: true, kec: true, kab: true, city: true, country: true,
+      gla_m2: true, opened_year: true, class: true, anchor_count: true,
+      has_cinema: true, has_supermarket: true, has_department_store: true,
+      visitor_estimate_daily: true,
+    },
+  })
+  const result = rows.map(r => ({
+    ...r,
+    lat: typeof r.lat === 'object' ? parseFloat(String(r.lat)) : r.lat,
+    lng: typeof r.lng === 'object' ? parseFloat(String(r.lng)) : r.lng,
+    class: r.class ? String(r.class) : 'regional',
+  }))
+  mallsCache = result
+  mallsCacheTime = now
+  return result
+}
+
+export function invalidateMallsCache() {
+  mallsCache = null
+  mallsCacheTime = 0
+}
+
+let poisCache: any[] | null = null
+let poisCacheTime = 0
+const POIS_CACHE_TTL_MS = 60_000
+
+/** Load ALL POIs from the DB (tourist + civic + crowd-density sources). */
+export async function loadPoisFromDB(): Promise<any[]> {
+  const now = Date.now()
+  if (poisCache && (now - poisCacheTime) < POIS_CACHE_TTL_MS) return poisCache
+  const rows = await prisma.poi.findMany({
+    select: { id: true, name: true, type: true, lat: true, lng: true, kec: true, kab: true, city: true, country: true, magnitude: true, notes: true },
+  })
+  const result = rows.map(r => ({
+    ...r,
+    lat: typeof r.lat === 'object' ? parseFloat(String(r.lat)) : r.lat,
+    lng: typeof r.lng === 'object' ? parseFloat(String(r.lng)) : r.lng,
+    type: String(r.type),
+  }))
+  poisCache = result
+  poisCacheTime = now
+  return result
+}
+
+export function invalidatePoisCache() {
+  poisCache = null
+  poisCacheTime = 0
+}
+
+let brandsCache: any[] | null = null
+let brandsCacheTime = 0
+const BRANDS_CACHE_TTL_MS = 60_000
+
+/** Load the full brand catalog from the DB (incl. brands created by scraping). */
+export async function loadBrandsFromDB(): Promise<any[]> {
+  const now = Date.now()
+  if (brandsCache && (now - brandsCacheTime) < BRANDS_CACHE_TTL_MS) return brandsCache
+  const rows = await prisma.brand.findMany({
+    select: {
+      id: true, name: true, parent: true, category: true, origin_country: true,
+      typical_size_m2: true, brand_strength: true, is_active: true,
+    },
+    where: { is_active: true },
+  })
+  const result = rows.map(r => ({
+    ...r,
+    parent: String(r.parent),
+    category: String(r.category),
+  }))
+  brandsCache = result
+  brandsCacheTime = now
+  return result
+}
+
+export function invalidateBrandsCache() {
+  brandsCache = null
+  brandsCacheTime = 0
+}

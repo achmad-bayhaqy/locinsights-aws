@@ -11,6 +11,7 @@ import {
   Shield, Users,
 } from 'lucide-react'
 import { useLanguage } from '@/lib/i18n/language-provider'
+import { fetchJson } from '@/lib/fetch-json'
 import type { OverviewData } from './types'
 
 interface Tenant {
@@ -51,8 +52,7 @@ export function MallTenants({ malls }: MallTenantAuditProps) {
     try {
       const mall = malls.find(m => m.id === selectedMallId)
       const url = `/api/locinsight/mall-tenants?mall_id=${selectedMallId}${mall ? `&mall_name=${encodeURIComponent(mall.name)}` : ''}`
-      const res = await fetch(url)
-      const json = await res.json()
+      const json = await fetchJson(url, {}, 20_000)
       if (json.success) setTenants(json.data)
       else setTenants([])
     } catch {
@@ -67,7 +67,7 @@ export function MallTenants({ malls }: MallTenantAuditProps) {
     if (!mall) return
     setScraping(true)
     try {
-      const res = await fetch('/api/locinsight/mall-tenants', {
+      const json = await fetchJson('/api/locinsight/mall-tenants', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -77,8 +77,7 @@ export function MallTenants({ malls }: MallTenantAuditProps) {
           lng: mall.lng,
           radius_km: 0.8, // 800m — better coverage for Bali malls
         }),
-      })
-      const json = await res.json()
+      }, 90_000)
       if (json.success) {
         toast.success(t('mall_tenants.toast_found', { total: json.total_found, map: json.map_brands_found, competitor: json.competitor_brands_found }))
         await loadTenants()

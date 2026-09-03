@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getTopOpportunities, type ScoringConfig, type ScoringWeights, DEFAULT_WEIGHTS } from '@/lib/scoring/engine'
-import { buildScoringConfig, loadKelurahanFromDB } from '@/lib/scoring/db-engine'
+import { buildScoringConfig, loadKelurahanFromDB, loadStoresFromDB, loadMallsFromDB } from '@/lib/scoring/db-engine'
 import { requirePermission } from '@/lib/auth-server'
 import { setTenantContext } from '@/lib/tenant-context'
 
@@ -49,11 +49,17 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  const kelurahanList = await loadKelurahanFromDB()
+  const [kelurahanList, dbStores, dbMalls] = await Promise.all([
+    loadKelurahanFromDB(),
+    loadStoresFromDB().catch(() => [] as any[]),
+    loadMallsFromDB().catch(() => [] as any[]),
+  ])
   const baseConfig: ScoringConfig = {
     brand_id: brandId,
     weights: hasCustomWeights ? customWeights : undefined,
     kelurahanList,
+    stores: dbStores.length > 0 ? dbStores : undefined,
+    malls: dbMalls.length > 0 ? dbMalls : undefined,
   }
   const config = await buildScoringConfig(baseConfig, { useTravelTime })
 

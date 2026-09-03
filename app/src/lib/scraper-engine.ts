@@ -17,18 +17,35 @@
  * narrows the scrape bbox to a specific kabupaten / kecamatan / kelurahan.
  *
  * Sources:
- *   - Nominatim: https://nominatim.openstreetmap.org/search (1 req/sec, valid UA)
- *   - Overpass:  https://overpass-api.de/api/interpreter (race against kumi.systems + osm.ch)
+ *   - Nominatim: https://nominatim.openstreetmap.org/search (1 req/sec, valid UA,
+ *     AbortController timeout, addressdetails for admin-boundary scoping)
+ *   - Overpass:  multi-endpoint failover via @/lib/overpass
+ *                (overpass-api.de + kumi.systems + maps.mail.ru)
  */
 
 import { db } from '@/lib/api-helpers'
 import { prisma } from '@/lib/db'
 import { isOnBaliLand } from '@/lib/data/bali-land'
 import { haversineKm } from '@/lib/data/bali-kelurahan'
-import { COMPETITOR_BRANDS, BALI_BBOX } from '@/lib/data/competitor-brands'
+import { COMPETITOR_BRANDS } from '@/lib/data/competitor-brands'
 import type { ScraperResultRow, GeocodedResult } from '@/lib/scraper-types'
+import {
+  runOverpass,
+  elementCoords,
+  type OverpassElement,
+} from '@/lib/overpass'
 
 const USER_AGENT = 'LocInsights/1.0 (MAP Active Adiperkasa Data Team)'
+
+/**
+ * Internal wall-clock budget for one scrape request.
+ *
+ * The route runs with maxDuration=60 and the ALB idles out at ~60s; when the
+ * scraper exceeds it, the gateway returns an HTML 504 page which the client
+ * chokes on ("Unexpected token '<'"). We now stop work gracefully at 45s and
+ * return whatever was collected as JSON instead.
+ */
+const SCRAPE_BUDGET_MS = 45_000
 
 // ============================================================================
 // TYPES
@@ -62,61 +79,28 @@ export interface ScrapeOutput {
   meta: {
     mode: ScrapeMode
     location_label: string
+    bbox: [number, number, number, number]
+    // keyword mode (Task 10-a)
+    /** true when results were matched by name~"query" (not just "everything in radius") */
+    name_matched?: boolean
+    /** OSM admin boundary (city/county/state) used to bound the Overpass area, if resolved */
+    admin_area?: string
+    /** true when the primary name-matched query failed over to the wider all-tags query */
+    query_widened?: boolean
+    // brand mode
     brands_scraped?: string[]
     brands_with_data?: number
-    bbox: [number, number, number, number]
+    /** true when the internal time budget stopped the sweep before all brands ran */
+    partial?: boolean
+    brands_skipped?: string[]
   }
 }
 
 // ============================================================================
-// OVERPASS — race 3 endpoints, throw on empty so Promise.any keeps waiting
+// OVERPASS — moved to @/lib/overpass (multi-endpoint failover: overpass-api.de
+// + kumi.systems + maps.mail.ru, per-attempt AbortController timeout, honest
+// empty-vs-failed distinction, connection cleanup). See src/lib/overpass.ts.
 // ============================================================================
-
-interface OverpassElement {
-  type: string
-  id: number
-  lat?: number
-  lon?: number
-  center?: { lat: number; lon: number }
-  tags?: Record<string, string>
-}
-
-async function runOverpass(query: string, timeoutMs = 20000): Promise<OverpassElement[]> {
-  const endpoints = [
-    'https://overpass-api.de/api/interpreter',
-    'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass.osm.ch/api/interpreter',
-  ]
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), timeoutMs)
-
-  const promises = endpoints.map(endpoint =>
-    fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': USER_AGENT },
-      body: `data=${encodeURIComponent(query)}`,
-      signal: controller.signal,
-    })
-      .then(res => {
-        if (!res.ok) throw new Error(`${res.status}`)
-        return res.json() as Promise<{ elements: OverpassElement[] }>
-      })
-      .then(data => {
-        const elements = data.elements || []
-        if (elements.length === 0) throw new Error('empty')
-        return elements
-      })
-  )
-
-  try {
-    const winner = await Promise.any(promises)
-    clearTimeout(timeout)
-    return winner
-  } catch {
-    clearTimeout(timeout)
-    return []
-  }
-}
 
 // ============================================================================
 // CACHED REVERSE GEOCODER — load kelurahan + malls ONCE per request
@@ -221,10 +205,34 @@ interface ResolvedLocation {
   centerLng?: number
 }
 
-async function resolveLocation(loc: LocationFilter | undefined): Promise<ResolvedLocation> {
-  // No filter — full Bali bbox
+/**
+ * Real bounding boxes for countries whose centroid rows may not exist yet in
+ * the countries table. Values are the official OSM/ISO extents — NOT synthetic.
+ */
+const COUNTRY_FALLBACK_BOXES: Record<string, { bbox: [number, number, number, number]; center: [number, number] }> = {
+  ID: { bbox: [-11.0, 94.9, 6.28, 141.02], center: [-2.2, 117.4] },
+  SG: { bbox: [1.13, 103.6, 1.47, 104.1], center: [1.3521, 103.8198] },
+  MY: { bbox: [0.85, 108.9, 7.4, 119.3], center: [4.2, 109.6] },
+  TH: { bbox: [5.6, 97.3, 20.5, 105.6], center: [15.1, 101.0] },
+  KH: { bbox: [10.4, 102.3, 14.7, 107.6], center: [12.6, 104.9] },
+  VN: { bbox: [8.2, 102.1, 23.4, 109.5], center: [16.0, 106.0] },
+  PH: { bbox: [4.5, 116.9, 18.5, 126.6], center: [12.9, 121.8] },
+  IN: { bbox: [6.7, 68.1, 35.5, 97.4], center: [22.0, 79.0] },
+  AU: { bbox: [-43.7, 112.9, -10.7, 153.6], center: [-25.3, 133.8] },
+}
+
+/** Point-in-bbox test with a small margin (km) — replaces the old Bali-only
+ *  land check so scrapes work for every country in the Data Manager. */
+export function isPointInBbox(lat: number, lng: number, bbox: [number, number, number, number], marginKm = 2): boolean {
+  const dLat = marginKm / 111
+  const dLng = marginKm / (111 * Math.cos((Math.max(-80, Math.min(80, lat)) * Math.PI) / 180))
+  return lat >= bbox[0] - dLat && lat <= bbox[2] + dLat && lng >= bbox[1] - dLng && lng <= bbox[3] + dLng
+}
+
+export async function resolveLocation(loc: LocationFilter | undefined): Promise<ResolvedLocation> {
+  // No filter — Indonesia-wide (the platform's home market), real bounds
   if (!loc || (!loc.country_id && !loc.province_code && !loc.kab_code && !loc.kec_code && !loc.kel_code)) {
-    return { bbox: BALI_BBOX, label: 'Bali (all)' }
+    return { bbox: COUNTRY_FALLBACK_BOXES.ID.bbox, label: 'Indonesia (all)', centerLat: COUNTRY_FALLBACK_BOXES.ID.center[0], centerLng: COUNTRY_FALLBACK_BOXES.ID.center[1] }
   }
 
   // Kelurahan-level: tight bbox around the kelurahan centroid
@@ -303,24 +311,33 @@ async function resolveLocation(loc: LocationFilter | undefined): Promise<Resolve
     }
   }
 
-  // Country-level: 200km radius around centroid (or fallback to Bali for ID)
+  // Country-level: use DB centroid when present, else official country bbox
   if (loc.country_id) {
     const c = await prisma.country.findUnique({
       where: { id: loc.country_id },
-      select: { id: true, name: true, iso2: true },
+      select: { id: true, name: true, iso2: true, lat: true, lng: true, radius_km: true },
     })
     if (c) {
-      // For Indonesia, default to Bali bbox (we don't have a country centroid)
-      if (c.id === 'ID' || c.iso2 === 'ID') {
-        return { bbox: BALI_BBOX, label: `Indonesia (Bali)` }
-      }
-      // For other countries, use a wide bbox — would need a country centroid table
-      return { bbox: BALI_BBOX, label: c.name }
+      const iso = (c.iso2 || c.id).toUpperCase()
+      const fb = COUNTRY_FALLBACK_BOXES[iso]
+      const r = c.radius_km ?? 1200
+      const clat = c.lat ?? fb?.center[0]
+      const clng = c.lng ?? fb?.center[1]
+      const bbox: [number, number, number, number] = (iso === 'ID')
+        ? COUNTRY_FALLBACK_BOXES.ID.bbox
+        : (fb && clat == null)
+          ? fb.bbox
+          : (() => {
+              const dLat = r / 111
+              const dLng = r / (111 * Math.cos((clat! * Math.PI) / 180))
+              return [clat! - dLat, clng! - dLng, clat! + dLat, clng! + dLng] as [number, number, number, number]
+            })()
+      return { bbox, label: c.name, centerLat: clat ?? undefined, centerLng: clng ?? undefined }
     }
   }
 
-  // Fallback: full Bali
-  return { bbox: BALI_BBOX, label: 'Bali (all)' }
+  // Fallback: Indonesia-wide
+  return { bbox: COUNTRY_FALLBACK_BOXES.ID.bbox, label: 'Indonesia (all)', centerLat: COUNTRY_FALLBACK_BOXES.ID.center[0], centerLng: COUNTRY_FALLBACK_BOXES.ID.center[1] }
 }
 
 // ============================================================================
@@ -334,29 +351,54 @@ interface NominatimResult {
   display_name: string
   type: string
   class: string
+  osm_type?: string
+  osm_id?: number
   address?: Record<string, string>
 }
 
-async function geocode(query: string, bbox: [number, number, number, number]): Promise<NominatimResult | null> {
+const NOMINATIM_TIMEOUT_MS = 12_000
+
+/** fetch() with an AbortController deadline — Nominatim must never hang a request. */
+async function timedFetch(url: string, headers: Record<string, string>, timeoutMs = NOMINATIM_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json', ...headers },
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function geocode(
+  query: string,
+  bbox: [number, number, number, number],
+  countryCode: string,
+  timeoutMs = NOMINATIM_TIMEOUT_MS,
+): Promise<NominatimResult | null> {
   const [s, w, n, e] = bbox
   const viewbox = `${w},${s},${e},${n}`
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(query)}&limit=1&countrycodes=id&viewbox=${viewbox}&bounded=1`
-  const res = await fetch(url, {
-    headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'id,en' },
-  })
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(query)}&limit=1&countrycodes=${countryCode}&viewbox=${viewbox}&bounded=1&addressdetails=1`
+  const res = await timedFetch(url, { 'Accept-Language': 'id,en' }, timeoutMs)
   if (!res.ok) throw new Error(`Nominatim ${res.status}`)
   const data = (await res.json()) as NominatimResult[]
   return data[0] || null
 }
 
-async function nominatimSearchByName(query: string, bbox: [number, number, number, number]): Promise<NominatimResult[]> {
+async function nominatimSearchByName(
+  query: string,
+  bbox: [number, number, number, number],
+  countryCode: string,
+  timeoutMs = NOMINATIM_TIMEOUT_MS,
+): Promise<NominatimResult[]> {
   const [s, w, n, e] = bbox
   const viewbox = `${w},${s},${e},${n}`
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(query)}&limit=20&countrycodes=id&viewbox=${viewbox}&bounded=1&addressdetails=1`
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(query)}&limit=20&countrycodes=${countryCode}&viewbox=${viewbox}&bounded=1&addressdetails=1`
   try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'id,en' },
-    })
+    const res = await timedFetch(url, { 'Accept-Language': 'id,en' }, timeoutMs)
     if (!res.ok) return []
     return (await res.json()) as NominatimResult[]
   } catch {
@@ -364,46 +406,161 @@ async function nominatimSearchByName(query: string, bbox: [number, number, numbe
   }
 }
 
+/**
+ * Resolve an OSM admin boundary (city / county / district / state) from the
+ * geocoded result's address parts, returning the Overpass area id
+ * (3600000000 + OSM relation id).
+ *
+ * Task 10-a: keyword searches used to query a raw bbox (often the FULL Bali
+ * bbox when no location filter was selected). Scoping by admin boundary
+ * gives the Overpass engine a much smaller, semantically meaningful area and
+ * dramatically reduces false-positive matches.
+ */
+async function resolveAdminArea(
+  geo: NominatimResult,
+  countryCode: string,
+  timeoutMs = 6_000,
+): Promise<{ areaId: number; label: string } | null> {
+  try {
+    const a = geo.address || {}
+    const candidates = [a.city, a.town, a.municipality, a.county, a.state_district, a.state]
+      .filter((c): c is string => !!c)
+      .filter((c, i, arr) => arr.indexOf(c) === i)
+      .slice(0, 2)
+    for (const cand of candidates) {
+      const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(cand)}&countrycodes=${countryCode}&limit=1`
+      const res = await timedFetch(url, { 'Accept-Language': 'id,en' }, timeoutMs)
+      if (!res.ok) continue
+      const rows = (await res.json()) as NominatimResult[]
+      const hit = rows.find(r => r.osm_type === 'relation' && r.osm_id)
+      if (hit) {
+        return { areaId: 3600000000 + Number(hit.osm_id), label: cand }
+      }
+    }
+  } catch {
+    // Graceful degradation — bbox-only scoping still works.
+  }
+  return null
+}
+
+async function resolveCountryCode(loc: LocationFilter | undefined): Promise<string> {
+  if (loc?.country_id) {
+    try {
+      const c = await prisma.country.findUnique({
+        where: { id: loc.country_id },
+        select: { iso2: true },
+      })
+      if (c?.iso2) return c.iso2.toLowerCase()
+    } catch { /* fall through to default */ }
+  }
+  // kab/kec/kel codes are Indonesian Kemendagri codes
+  return 'id'
+}
+
 // ============================================================================
 // OVERPASS QUERY BUILDER — for keyword mode (multiple kinds)
 // ============================================================================
 
-function buildOverpassQueryByKind(bbox: [number, number, number, number], kind: ItemKind): string {
+/**
+ * Spatial clause for Overpass statements: intersect the bbox with an OSM
+ * admin-boundary area when one was resolved (region filter), so queries are
+ * bounded by real admin boundaries instead of a global bbox.
+ */
+function spatialClause(bbox: [number, number, number, number], areaId?: number): string {
   const [s, w, n, e] = bbox
-  const bboxStr = `${s},${w},${n},${e}`
-  const tagFilters: string[] = []
+  const bboxPart = `(${s},${w},${n},${e})`
+  return areaId ? `(area:${areaId})${bboxPart}` : bboxPart
+}
+
+/**
+ * Build a case-insensitive Overpass name regex from a free-text query.
+ * "Starbucks Kuta" → `(^|[^a-z0-9_])(starbucks kuta|starbucks)([^a-z0-9_]|$)`
+ * — an alternation over progressive token prefixes (≥3 chars) so brand+location
+ * queries still match plain brand names in OSM, with word-ish boundaries so
+ * "Zara" no longer matches "Bazar".
+ *
+ * Punctuation is replaced with "." and no backslash escapes are emitted:
+ * Overpass QL string escaping of backslashes differs across mirrors, so the
+ * pattern must be QL-safe without any `\\` (bonus: "j.co" also matches "jco").
+ */
+function buildNamePattern(query: string): string {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean)
+  const candidates: string[] = []
+  for (let n = tokens.length; n >= 1; n--) {
+    const cand = tokens.slice(0, n).join(' ')
+    if (cand.length >= 3 && !candidates.includes(cand)) candidates.push(cand)
+  }
+  if (candidates.length === 0) candidates.push(query.toLowerCase())
+  const safe = candidates.map(c => c.replace(/[^a-z0-9 ]/g, '.'))
+  return `(^|[^a-z0-9_])(${safe.join('|')})([^a-z0-9_]|$)`
+}
+
+/**
+ * PRIMARY keyword query: name~"query" ANDed with relevant
+ * amenity/shop/tourism filters per kind, bounded by admin area (when
+ * resolved) intersected with the radius bbox.
+ */
+function buildKeywordQuery(kind: ItemKind, spatial: string, namePattern: string): string {
+  const nameSel = `["name"~"${namePattern}",i]`
+  const stmts: string[] = []
   if (kind === 'store') {
-    tagFilters.push(
-      'node["amenity"~"cafe|restaurant|fast_food|bar|pub"](bbox);',
-      'node["shop"~"clothes|shoes|sports|jewelry|beauty|bakery|confectionery|coffee|bag|fashion_accessories|convenience|supermarket|pharmacy"](bbox);',
-      'way["amenity"~"cafe|restaurant|fast_food|bar|pub"](bbox);',
-      'way["shop"~"clothes|shoes|sports|jewelry|beauty|bakery|confectionery|coffee|bag|fashion_accessories|convenience|supermarket|pharmacy"](bbox);',
+    stmts.push(
+      `nwr${nameSel}["amenity"~"cafe|restaurant|fast_food|bar|pub|food_court|ice_cream"]${spatial};`,
+      `nwr${nameSel}["shop"]${spatial};`,
     )
   } else if (kind === 'mall') {
-    tagFilters.push(
-      'node["shop"="mall"](bbox);',
-      'way["shop"="mall"](bbox);',
-      'relation["shop"="mall"](bbox);',
-      'way["building"="retail"](bbox);',
+    stmts.push(
+      `nwr${nameSel}["shop"~"mall|department_store"]${spatial};`,
+      `nwr${nameSel}["building"="retail"]${spatial};`,
+      `nwr${nameSel}["landuse"="retail"]${spatial};`,
     )
   } else {
-    tagFilters.push(
-      'node["tourism"~"hotel|attraction|museum|gallery|theme_park|zoo"](bbox);',
-      'way["tourism"~"hotel|attraction|museum|gallery|theme_park|zoo"](bbox);',
-      'node["leisure"~"park|sports_centre|stadium|swimming_pool|beach_resort"](bbox);',
-      'node["amenity"~"university|hospital|bus_station|ferry_terminal|cinema|theatre"](bbox);',
-      'node["natural"="beach"](bbox);',
-      'way["natural"="beach"](bbox);',
+    stmts.push(
+      `nwr${nameSel}["tourism"]${spatial};`,
+      `nwr${nameSel}["leisure"~"park|sports_centre|stadium|water_park|beach_resort|golf_course"]${spatial};`,
+      `nwr${nameSel}["amenity"~"university|college|hospital|bus_station|ferry_terminal|cinema|theatre|place_of_worship"]${spatial};`,
+      `nwr${nameSel}["natural"="beach"]${spatial};`,
     )
   }
-  const q = `[out:json][timeout:15];(${tagFilters.join('')});out center 200;`
-  return q.replace(/bbox/g, bboxStr)
+  return `[out:json][timeout:25];(${stmts.join('')});out center 200;`
+}
+
+/**
+ * WIDENED fallback query (no name filter): all tagged elements of the
+ * requested kinds inside the spatial filter. Only used when the name-matched
+ * query returned nothing.
+ */
+function buildOverpassQueryByKind(bbox: [number, number, number, number], kind: ItemKind, areaId?: number): string {
+  const spatial = spatialClause(bbox, areaId)
+  const stmts: string[] = []
+  if (kind === 'store') {
+    stmts.push(
+      `nwr["amenity"~"cafe|restaurant|fast_food|bar|pub|food_court|ice_cream"]${spatial};`,
+      `nwr["shop"~"clothes|shoes|sports|jewelry|beauty|bakery|confectionery|coffee|bag|fashion_accessories|convenience|supermarket|pharmacy"]${spatial};`,
+    )
+  } else if (kind === 'mall') {
+    stmts.push(
+      `nwr["shop"~"mall|department_store"]${spatial};`,
+      // Task 10-a: require a name on retail buildings — unnamed ones were a
+      // major source of junk rows in keyword mode.
+      `nwr["building"="retail"]["name"]${spatial};`,
+      `nwr["landuse"="retail"]["name"]${spatial};`,
+    )
+  } else {
+    stmts.push(
+      `nwr["tourism"~"hotel|attraction|museum|gallery|theme_park|zoo"]${spatial};`,
+      `nwr["leisure"~"park|sports_centre|stadium|swimming_pool|beach_resort"]${spatial};`,
+      `nwr["amenity"~"university|hospital|bus_station|ferry_terminal|cinema|theatre"]${spatial};`,
+      `nwr["natural"="beach"]${spatial};`,
+    )
+  }
+  return `[out:json][timeout:25];(${stmts.join('')});out center 200;`
 }
 
 function buildOverpassQueryByTag(bbox: [number, number, number, number], tag: string): string {
   const [s, w, n, e] = bbox
   const bboxStr = `${s},${w},${n},${e}`
-  const q = `[out:json][timeout:15];(node[${tag}](${bboxStr});way[${tag}](${bboxStr}););out center 200;`
+  const q = `[out:json][timeout:20];(nwr[${tag}](${bboxStr}););out center 200;`
   return q
 }
 
@@ -507,15 +664,26 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
     }
     const query = req.query.trim()
     const kinds = req.kinds && req.kinds.length > 0 ? req.kinds : (['store', 'mall', 'poi'] as ItemKind[])
+    const startedAt = Date.now()
+    // Shared deadline: every network call gets min(cap, remaining budget) so
+    // the route can never be killed by the 60s function/ALB limit and answer
+    // with an HTML error page (Task 10-a bug 1).
+    const deadline = startedAt + SCRAPE_BUDGET_MS
+    const budgetLeft = (capMs: number, minMs = 8_000) =>
+      Math.max(minMs, Math.min(capMs, deadline - Date.now()))
 
-    // 1) Geocode the query → center point
-    const geo = await geocode(query, bbox)
+    // 0) Country/region scope for Nominatim (multi-country support; kab/kec/kel
+    //    codes are Indonesian, so they imply 'id').
+    const countryCode = await resolveCountryCode(req.location)
+
+    // 1) Geocode the query → center point (+ addressdetails for admin scoping)
+    const geo = await geocode(query, bbox, countryCode, budgetLeft(NOMINATIM_TIMEOUT_MS))
     if (!geo) {
       throw new Error(`Place not found in ${resolved.label} — try a more specific query`)
     }
     const lat = parseFloat(geo.lat)
     const lng = parseFloat(geo.lon)
-    const isBali = isOnBaliLand(lat, lng, 2)
+    const inScope = isPointInBbox(lat, lng, bbox, 3)
 
     // 2) Compute scrape bbox = geo center ± radius, intersected with location bbox
     const radius = req.radius_km ?? 5
@@ -528,20 +696,48 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
       Math.min(lng + dLng, bbox[3]),
     ]
 
-    // 3) Run all kinds in PARALLEL (was sequential → 60s+ timeout)
-    const kindResults = await Promise.all(
+    // 3) Bound the query by an OSM admin boundary (city/county/state derived
+    //    from the geocoded address) — Task 10-a. The old code swept a raw
+    //    bbox (the FULL Bali bbox when no location filter was selected),
+    //    returning every shop/café in the area regardless of the keyword.
+    const adminArea = await resolveAdminArea(geo, countryCode, budgetLeft(6_000))
+    const spatial = spatialClause(qBbox, adminArea?.areaId)
+    const namePattern = buildNamePattern(query)
+
+    const toPairs = (elements: OverpassElement[], k: ItemKind) =>
+      elements.map(element => ({ element, kind: k }))
+
+    // 4) PRIMARY: name-matched query per kind, in PARALLEL
+    //    name~"query" ANDed with relevant amenity/shop/tourism filters.
+    const primary = await Promise.all(
       kinds.map(async (k) => {
-        const q = buildOverpassQueryByKind(qBbox, k)
-        const elements = await runOverpass(q)
-        return elements.map(element => ({ element, kind: k }))
+        const r = await runOverpass(buildKeywordQuery(k, spatial, namePattern), { timeoutMs: budgetLeft(25_000) })
+        return toPairs(r.elements, k)
       })
     )
-    let allElements: Array<{ element: OverpassElement; kind: ItemKind }> = kindResults.flat()
+    let allElements: Array<{ element: OverpassElement; kind: ItemKind }> = primary.flat()
+    const nameMatched = allElements.length > 0
+    let queryWidened = false
 
+    // 5) FALLBACK 1 — widen to all tagged elements of the requested kinds
+    //    (no name filter). Only when the name-matched query found nothing,
+    //    e.g. the keyword is a category word that never appears in OSM names.
+    if (!nameMatched) {
+      queryWidened = true
+      const widened = await Promise.all(
+        kinds.map(async (k) => {
+          const r = await runOverpass(buildOverpassQueryByKind(qBbox, k, adminArea?.areaId), { timeoutMs: budgetLeft(25_000) })
+          return toPairs(r.elements, k)
+        })
+      )
+      allElements = widened.flat()
+    }
+
+    // 6) FALLBACK 2 — Nominatim free-text search (existing behavior)
     let usedFallback = false
     if (allElements.length === 0) {
       usedFallback = true
-      const nomResults = await nominatimSearchByName(query, qBbox)
+      const nomResults = await nominatimSearchByName(query, qBbox, countryCode, budgetLeft(NOMINATIM_TIMEOUT_MS))
       for (const r of nomResults) {
         const k: ItemKind = r.class === 'amenity' ? 'store' : r.class === 'shop' ? 'store' : 'poi'
         allElements.push({
@@ -564,16 +760,33 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
       }
     }
 
-    // 4) Build result rows (uses cached reverse-geocoder — fast)
+    // 7) Dedupe — the same OSM feature can arrive from node+way statements or
+    //    overlap between kinds (Task 10-a).
+    const seenKeys = new Set<string>()
+    const dedupedPairs: Array<{ element: OverpassElement; kind: ItemKind }> = []
+    for (const pair of allElements) {
+      const c = elementCoords(pair.element)
+      const key = pair.element.type && pair.element.id
+        ? `${pair.element.type}/${pair.element.id}`
+        : c
+          ? `${c.lat.toFixed(5)},${c.lng.toFixed(5)}`
+          : `anon_${dedupedPairs.length}`
+      if (seenKeys.has(key)) continue
+      seenKeys.add(key)
+      dedupedPairs.push(pair)
+    }
+
+    // 8) Build result rows (uses cached reverse-geocoder — fast)
     const results: ScraperResultRow[] = []
-    for (const { element, kind: elKind } of allElements) {
-      const elat = element.lat ?? element.center?.lat
-      const elng = element.lon ?? element.center?.lon
-      if (elat == null || elng == null) continue
+    for (const { element, kind: elKind } of dedupedPairs) {
+      const coords = elementCoords(element)
+      if (!coords) continue
+      const elat = coords.lat
+      const elng = coords.lng
 
       const tags = element.tags || {}
       const name = elementName(tags, `${elKind}_${element.id}`)
-      const onLand = isOnBaliLand(elat, elng, 1)
+      const onLand = isPointInBbox(elat, elng, bbox, 2)
       const geo = await cache.reverseGeocode(elat, elng)
       const mallInfo = await cache.detectMall(elat, elng)
       const address = tags['addr:street']
@@ -631,7 +844,7 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
     }
 
     return {
-      geocoded: { lat, lng, display_name: geo.display_name, is_in_bali: isBali, address: geo.address },
+      geocoded: { lat, lng, display_name: geo.display_name, is_in_bali: inScope, address: geo.address },
       used_fallback: usedFallback,
       source: usedFallback ? 'nominatim' : 'overpass',
       results,
@@ -639,6 +852,10 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
         mode: 'keyword',
         location_label: resolved.label,
         bbox: qBbox,
+        name_matched: nameMatched,
+        query_widened: queryWidened,
+        admin_area: adminArea?.label,
+        ...(Date.now() - startedAt > SCRAPE_BUDGET_MS ? { partial: true } : {}),
       },
     }
   }
@@ -658,15 +875,32 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
     const allResults: ScraperResultRow[] = []
     let usedFallback = false
     let brandsWithData = 0
+    let anyEndpointFailed = false
+    const startedAt = Date.now()
+    const brandsSkipped: string[] = []
+    let partial = false
 
     for (let i = 0; i < brandsToScrape.length; i += BATCH_SIZE) {
+      // Graceful degradation: stop before the 60s function/ALB limit and
+      // return what we have as JSON instead of letting the gateway answer
+      // with an HTML 504 page (Task 10-a bug 1).
+      if (Date.now() - startedAt > SCRAPE_BUDGET_MS) {
+        partial = true
+        for (const b of brandsToScrape.slice(i)) brandsSkipped.push(b.name)
+        break
+      }
+
       const batch = brandsToScrape.slice(i, i + BATCH_SIZE)
       const batchResults = await Promise.all(
         batch.map(async (brand) => {
           const buildQuery = (tag: string) => buildOverpassQueryByTag(bbox, tag)
-          let elements = await runOverpass(buildQuery(brand.osm_tag))
+          const primary = await runOverpass(buildQuery(brand.osm_tag), { timeoutMs: 20_000 })
+          if (primary.failed) anyEndpointFailed = true
+          let elements = primary.elements
           if (elements.length === 0 && brand.osm_tag_fallback) {
-            elements = await runOverpass(buildQuery(brand.osm_tag_fallback))
+            const fallback = await runOverpass(buildQuery(brand.osm_tag_fallback), { timeoutMs: 20_000 })
+            if (fallback.failed) anyEndpointFailed = true
+            elements = fallback.elements
           }
           return { brand, elements }
         })
@@ -683,7 +917,7 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
           const elat = el.lat ?? el.center?.lat
           const elng = el.lon ?? el.center?.lon
           if (elat == null || elng == null) continue
-          const onLand = isOnBaliLand(elat, elng, 1)
+          const onLand = isPointInBbox(elat, elng, bbox, 2)
           const tags = el.tags || {}
           const geo = await cache.reverseGeocode(elat, elng)
           const mallInfo = await cache.detectMall(elat, elng)
@@ -714,7 +948,13 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
     }
 
     if (brandsWithData === 0) {
-      throw new Error('Overpass API returned no data for any of the selected brands. Try again in a minute, select fewer brands, or narrow the location filter.')
+      throw new Error(
+        partial
+          ? `Brand sweep hit its internal ${Math.round(SCRAPE_BUDGET_MS / 1000)}s time budget before any brand returned data (Overpass was too slow or rate-limiting). Brands skipped: ${brandsSkipped.join(', ') || 'remaining'}. Select fewer brands and retry.`
+          : anyEndpointFailed
+            ? 'All Overpass endpoints failed or returned no data for the selected brands (possible rate-limiting or temporary outage). Try again in a minute, or select fewer brands.'
+            : 'Overpass API returned no data for any of the selected brands. Try again in a minute, select fewer brands, or narrow the location filter.',
+      )
     }
 
     // Dedupe by lat+lng (~1m)
@@ -736,6 +976,8 @@ export async function runScrape(req: ScrapeRequest): Promise<ScrapeOutput> {
         bbox,
         brands_scraped: brandsToScrape.map(b => b.name),
         brands_with_data: brandsWithData,
+        partial,
+        ...(brandsSkipped.length > 0 ? { brands_skipped: brandsSkipped } : {}),
       },
     }
   }

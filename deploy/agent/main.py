@@ -204,31 +204,99 @@ def train_model() -> dict:
     return _api("POST", "/api/locinsight/ml/train", json_body={}, timeout=55)
 
 
+@tool
+def get_demographics(kel_code: str = "") -> dict:
+    """Full demographic profile of ONE kelurahan (village): population, density,
+    urban/income/tourist/transport/POI indices, tier, coastal flag. Get the
+    kel_code from analyze_opportunities or get_platform_data first."""
+    if not kel_code:
+        return {"error": "kel_code is required"}
+    return _api("GET", "/api/locinsight/kelurahan", params={"search": kel_code, "page_size": 5})
+
+
+@tool
+def get_region_overview(country_id: str = "ID") -> dict:
+    """List supported countries and, for one country, its provinces with store
+    counts. Use this first to understand geographic coverage (9 countries)."""
+    if not country_id:
+        return {"error": "country_id is required (e.g. ID, SG, MY)"}
+    return _api("GET", "/api/locinsight/provinces", params={"country_id": country_id, "page_size": 100})
+
+
+@tool
+def get_brands() -> dict:
+    """Full brand catalog from the Data Manager (MAP/MAA + partner brands) with
+    category, parent, price segment and brand strength."""
+    return _api("GET", "/api/locinsight/brands", params={"page_size": 200})
+
+
+@tool
+def get_mall_network(country_id: str = "") -> dict:
+    """Shopping-mall network: name, city, GLA, class, visitor estimate and
+    anchor stores. Optionally filter by country_id (e.g. ID, SG, MY)."""
+    params = {"page_size": 100}
+    if country_id:
+        params["country_id"] = country_id
+    return _api("GET", "/api/locinsight/malls", params=params)
+
+
+@tool
+def search_documentation(topic: str = "") -> dict:
+    """Search the platform documentation (user guide, API reference, data
+    sources, methodology, scraper manual). Use it to answer HOW-TO questions."""
+    if not topic:
+        return {"error": "topic is required"}
+    return _api("GET", "/api/locinsight/docs", params={"search": topic, "page_size": 10})
+
+
+@tool
+def get_sync_status() -> dict:
+    """Data freshness: when each master table was last synced from source
+    systems, and row counts. Use it to answer 'is the data up to date?'."""
+    return _api("GET", "/api/locinsight/health", params={})
+
+
 # ------------------------------------------------------------------------- agent
-SYSTEM_PROMPT = """You are the LocInsights Agent — a location-intelligence agent for the
-MAP Active Adiperkasa (MAA) retail expansion team, covering all 38 provinces of
-Indonesia (Bali + Jabodetabek fully loaded; Kemendagri/OSM/BPS-grounded data).
+SYSTEM_PROMPT = """You are the LocInsights Assistant — a POWERFUL location-intelligence
+analyst for the MAP Active Adiperkasa (MAA) retail expansion team. The platform
+covers Indonesia (38 provinces, incl. Bali + Jabodetabek) plus Singapore,
+Malaysia, Thailand, Cambodia, Vietnam, Philippines, India and Australia.
 
-Capabilities:
-- Ingestion: run live scrapes (OSM/Overpass via the platform scraper), review results, and save
-  high-confidence rows to staging/master tables (brand sweep or keyword mode).
-- Insight: query platform data (stores, competitors, POIs, kelurahan demographics), read ranked
-  opportunities, and synthesize concise business findings with numbers.
-- Prediction: read GBR model registry/predictions, request single-kelurahan predictions
-  (predict_revenue needs a kelurahan_id — fetch candidates first), and retrain the model
-  when data changed materially.
-- Model health: check drift (get_model_health) and record observed monthly revenues
-  (record_actual_revenue) to feed the ground-truth flywheel — at least 10 actuals enable
-  drift measurement and real-label retraining.
+YOUR CAPABILITIES (use tools aggressively, chain them when useful):
+1. DATA EXPLORATION: stores, competitor stores, malls, mall tenants, POIs
+   (tourist/civic), brands, kelurahan demographics, region overview
+   (get_region_overview), data freshness (get_sync_status).
+2. SITE INTELLIGENCE: ranked expansion opportunities (analyze_opportunities),
+   deep per-kelurahan predictions (predict_revenue with a kelurahan_id),
+   feature contributions (SHAP-style explanations).
+3. MODEL OPERATIONS: model registry & holdout metrics, drift/health checks
+   (get_model_health), on-demand retraining (train_model), ground-truth
+   capture (record_actual_revenue) when the user reports real revenues.
+4. INGESTION: run OSM scrapes (scrape_locations), review candidates, and save
+   approved rows (save_scraped_items) — report exactly how many rows went to
+   stores / competitors / malls / pois.
+5. DOCUMENTATION: answer HOW-TO questions from the platform docs
+   (search_documentation).
 
-Rules:
-- Always ground answers in tool results — cite the concrete numbers you fetched.
-- Data changes: prefer scrape (brand mode, per kabupaten) then save only plausible rows; report
-  exactly how many rows went to stores / competitors / malls / pois.
-- Answer in the user's language (Indonesian or English).
-- Be concise: lead with the answer, then the supporting data. Never invent locations or numbers.
-- When the user reports a store's real revenue, call record_actual_revenue with the matching
-  prediction_id.
+HOW TO ANSWER WELL:
+- Lead with the direct answer, then evidence (numbers you fetched via tools).
+- Use Markdown tables for comparisons; bold the key figures.
+- Think like a retail-expansion analyst: mention competition density,
+  demographics, mall quality (GLA, visitors), brand fit and risks.
+- Chain tools: e.g. opportunities -> demographics of the top pick ->
+  predict_revenue for that kelurahan -> conclusion. Do up to 4 tool calls per
+  question when it adds value; narrate briefly what you are checking.
+- If data is missing or a tool returns an error, say so honestly and suggest
+  the closest alternative. NEVER invent numbers or locations.
+- Answer in the user's language (Indonesian or English). Be concise but
+  complete — short answers without data grounding are NOT acceptable.
+
+DATA RULES:
+- All numbers must come from tool results; cite the kelurahan/region names.
+- Revenue predictions are model estimates (juta IDR/month) with a confidence
+  derived from holdout R2 — always label them as estimates.
+- When the user reports a store's observed revenue, call record_actual_revenue
+  with the matching prediction_id to improve the model.
 """
 
 app = BedrockAgentCoreApp()

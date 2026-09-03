@@ -26,9 +26,9 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { isOnBaliLand } from '@/lib/data/bali-land'
 import { haversineKm } from '@/lib/data/bali-kelurahan'
 import { classifyScrapedBrand } from '@/lib/brand-classifier'
+import { resolveLocation, isPointInBbox } from '@/lib/scraper-engine'
 import type { ScraperResultRow } from '@/lib/scraper-types'
 import { requirePermission } from '@/lib/auth-server'
 import { setTenantContext, tenantFilter, withTenantId } from '@/lib/tenant-context'
@@ -40,19 +40,26 @@ export const maxDuration = 30
 interface SaveItem extends ScraperResultRow {}
 
 export async function POST(req: NextRequest) {
-  const auth = await requireSuperadmin()
-  if (!auth.ok) return auth.response
-
+  // Whole handler wrapped so every failure path returns JSON (Task 10-a).
   try {
-    const auth = await requirePermission('scraper', 'create')
+    const auth = await requireSuperadmin()
     if (!auth.ok) return auth.response
-    await setTenantContext(auth.session)
 
-    const body = await req.json()
-    const { run_id, items } = body as {
+    const auth2 = await requirePermission('scraper', 'create')
+    if (!auth2.ok) return auth2.response
+    await setTenantContext(auth2.session)
+
+    let body: any
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ success: false, error: 'Invalid JSON body' }, { status: 400 })
+    }
+    const { run_id, items, location } = body as {
       run_id?: string
       query?: string
       items: SaveItem[]
+      location?: { country_id?: string; province_code?: string; kab_code?: string; kec_code?: string; kel_code?: string }
     }
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -65,7 +72,11 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    const tf = tenantFilter(auth.session)
+    const tf = tenantFilter(auth2.session)
+
+    // Resolve the target-area bbox from the SAME location filter the scrape
+    // used (body.location) — items outside it are rejected below.
+    const resolvedBbox = (await resolveLocation(location)).bbox
 
     // Load existing competitor stores once for dedup (50m rule) — tenant-scoped
     const existingCompetitors = await prisma.competitorStore.findMany({
@@ -102,9 +113,11 @@ export async function POST(req: NextRequest) {
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
       try {
-        // Validate on land
-        if (!isOnBaliLand(item.lat, item.lng, 1)) {
-          errors.push({ index: i, name: item.name, error: 'Location is in the sea — skipped' })
+        // Validate against the TARGET AREA bbox (works for every country in the
+        // Data Manager — the old check hardcoded Bali and silently dropped
+        // every save outside Bali with "Location is in the sea").
+        if (!resolvedBbox || !isPointInBbox(item.lat, item.lng, resolvedBbox, 5)) {
+          errors.push({ index: i, name: item.name, error: 'Location is outside the selected target area — skipped' })
           skipped++
           continue
         }

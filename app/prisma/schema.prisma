@@ -100,6 +100,11 @@ model Country {
   name       String
   iso2       String?
   iso3       String?
+  /// Centroid used by the scraper to bound country-level searches (real value)
+  lat        Float?
+  lng        Float?
+  /// Search radius (km) for country-level scrapes
+  radius_km  Int?
   created_at DateTime    @default(now()) @db.Timestamptz(6)
   updated_at DateTime    @default(now()) @db.Timestamptz(6)
   provinces  Province[]

@@ -454,28 +454,38 @@ export function getDashboardStats(
   competitorStores: CompetitorStoreLite[] = [],
   storesInput?: any[],
   kelurahanInput?: Kelurahan[],
+  mallsInput?: any[],
+  brandsInput?: any[],
 ): DashboardStats {
   const stores = storesInput && storesInput.length > 0 ? storesInput : BALI_STORES
   const kelList = kelurahanInput && kelurahanInput.length > 0 ? kelurahanInput : BALI_KELURAHAN
-  const allScores = kelList.map(k => scoreKelurahan(k, { competitorStores, kelurahanList: kelList })).sort((a, b) => b.composite_score - a.composite_score)
+  // DB-driven malls & brands (static Bali arrays only as cold-dev fallback)
+  const malls = mallsInput && mallsInput.length > 0 ? mallsInput : BALI_MALLS
+  const brands = brandsInput && brandsInput.length > 0 ? brandsInput : BRANDS
+  const allScores = kelList.map(k => scoreKelurahan(k, { competitorStores, kelurahanList: kelList, malls })).sort((a, b) => b.composite_score - a.composite_score)
 
-  const KAB_TIER: Record<string, 1 | 2 | 3> = {
-    'Badung': 1, 'Denpasar': 1,
-    'Tabanan': 2, 'Gianyar': 2, 'Buleleng': 2,
-    'Jembrana': 3, 'Klungkung': 3, 'Bangli': 3, 'Karangasem': 3,
+  // Tier per kabupaten derived from the injected kelurahan list (DB) — works
+  // for all 38 provinces + international regions, no hardcoded Bali names.
+  const kabTierFromKel = new Map<string, number>()
+  for (const k of kelList) {
+    const raw = (k as any).tier
+    const t = typeof raw === 'string' ? Number(String(raw).replace('tier_', '')) : raw
+    if (Number.isFinite(t) && (k as any).kab_name && !kabTierFromKel.has((k as any).kab_name)) {
+      kabTierFromKel.set((k as any).kab_name, t as number)
+    }
   }
-  const tier1Stores = stores.filter(s => KAB_TIER[s.kab] === 1).length
-  const tier2Stores = stores.filter(s => KAB_TIER[s.kab] === 2).length
-  const tier3Stores = stores.filter(s => KAB_TIER[s.kab] === 3).length
+  const tier1Stores = stores.filter(s => kabTierFromKel.get(s.kab) === 1).length
+  const tier2Stores = stores.filter(s => kabTierFromKel.get(s.kab) === 2).length
+  const tier3Stores = stores.filter(s => kabTierFromKel.get(s.kab) === 3).length
 
   const anchorBrandIds = ['BR101', 'BR102', 'BR201', 'BR202', 'BR203']
-  const mallsWithoutAnchor = BALI_MALLS.filter(m => {
+  const mallsWithoutAnchor = malls.filter(m => {
     if (m.visitor_estimate_daily === 0) return false
     const storesInMall = stores.filter(s => s.mall_id === m.id)
     return !storesInMall.some(s => anchorBrandIds.includes(s.brand_id))
   })
 
-  const brandCoverage = BRANDS.map(b => ({
+  const brandCoverage = brands.map(b => ({
     brand: b.name,
     stores: stores.filter(s => s.brand_id === b.id || s.brand_name === b.name).length,
     category: b.category,
@@ -489,7 +499,7 @@ export function getDashboardStats(
   return {
     total_kelurahan: kelList.length,
     total_stores: stores.length,
-    total_malls: BALI_MALLS.length,
+    total_malls: malls.length,
     total_competitor_stores: competitorStores.length,
     tier_1_stores: tier1Stores,
     tier_2_stores: tier2Stores,

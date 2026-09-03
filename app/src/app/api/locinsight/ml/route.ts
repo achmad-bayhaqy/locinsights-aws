@@ -304,7 +304,9 @@ export async function GET(req: NextRequest) {
     }
 
     if (action === 'clusters') {
-      const all = scoreAllKelurahan()
+      // Score the FULL DB kelurahan list (all regions) — static fallback only in cold dev
+      const kelList = await loadKelurahanFromDB()
+      const all = scoreAllKelurahan({ kelurahanList: kelList })
       const archetypes = [
         { id: 0, name: 'Premium Urban Core', color: '#7A0A1A', count: 0, members: [] as string[] },
         { id: 1, name: 'Tourist Hub', color: '#C8102E', count: 0, members: [] as string[] },

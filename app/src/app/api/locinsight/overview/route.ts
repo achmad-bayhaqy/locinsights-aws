@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getDashboardStats, getTopOpportunities } from '@/lib/scoring/engine'
 import { BALI_STORES } from '@/lib/data/bali-stores'
 import { BALI_MALLS } from '@/lib/data/bali-malls'
+import { loadMallsFromDB, loadBrandsFromDB, loadPoisFromDB, buildScoringConfig } from '@/lib/scoring/db-engine'
 import { BALI_KELURAHAN } from '@/lib/data/bali-kelurahan'
 import { BRANDS } from '@/lib/data/brands'
 import { BALI_POIS } from '@/lib/data/bali-poi'
@@ -43,20 +44,33 @@ export async function GET(req: NextRequest) {
     // through within the TTL window. Acceptable for v1 (single-tenant
     // deployment is the common case); for true multi-tenant isolation, the
     // cache should be keyed by tenant_id in a future iteration.
-    const [competitors, dbStores, dbKelurahan] = await Promise.all([
+    const [competitors, dbStores, dbKelurahan, dbMalls, dbBrands, dbPois] = await Promise.all([
       loadCompetitorStores(),
       loadStoresFromDB().catch((e) => {
         console.warn('[overview] DB stores load failed, falling back to static:', e)
         return [] as any[]
       }),
       loadKelurahanFromDB(),
+      loadMallsFromDB().catch(() => [] as any[]),
+      loadBrandsFromDB().catch(() => [] as any[]),
+      loadPoisFromDB().catch(() => [] as any[]),
     ])
 
-    // Use DB stores if available, otherwise static
+    // Use DB as source of truth; static Bali arrays are cold-dev fallback only
     const storesSource = dbStores.length > 0 ? dbStores : BALI_STORES
     const kelurahanSource = dbKelurahan.length > 0 ? dbKelurahan : BALI_KELURAHAN
+    const mallsSource = dbMalls.length > 0 ? dbMalls : BALI_MALLS
+    const brandsSource = dbBrands.length > 0 ? dbBrands : BRANDS
+    const poisSource = dbPois.length > 0 ? dbPois : BALI_POIS
 
-    const stats = getDashboardStats(competitors, storesSource, kelurahanSource)
+    const scoringCfg = await buildScoringConfig({
+      brand_id: brandId,
+      kelurahanList: kelurahanSource,
+      stores: storesSource,
+      malls: mallsSource,
+      useTravelTime: true,
+    })
+    const stats = getDashboardStats(competitors, storesSource, kelurahanSource, mallsSource, brandsSource)
     // Per user request (Aug 2026): "All Indicators — Combined Table" should
     // show ALL kelurahan rows, not just the top 100. Bali has ~716 kelurahan,
     // so we pass a large limit (9999) — getTopOpportunities slices to N, but
@@ -64,12 +78,7 @@ export async function GET(req: NextRequest) {
     // The function still sorts by composite_score desc, so the dashboard's
     // top-opportunities list (which uses data.top_opportunities[0]) keeps the
     // highest-scoring kelurahan at the top.
-    const topOpps = getTopOpportunities(9999, {
-      brand_id: brandId,
-      competitorStores: competitors,
-      kelurahanList: kelurahanSource,
-      useTravelTime: true,
-    }, tierFilter)
+    const topOpps = getTopOpportunities(9999, scoringCfg, tierFilter)
 
     // Phase 3: count of field surveys + training runs (tenant-scoped).
     // Include NULL tenant_id (system) rows alongside the current tenant's.
@@ -129,7 +138,7 @@ export async function GET(req: NextRequest) {
           opened_year: s.opened_year,
           confirmed: s.confirmed,
         })),
-        malls: BALI_MALLS.map(m => ({
+        malls: mallsSource.map(m => ({
           id: m.id,
           name: m.name,
           lat: m.lat,
@@ -161,7 +170,7 @@ export async function GET(req: NextRequest) {
           poi_density_index: k.poi_density_index,
           is_coastal: k.is_coastal,
         })),
-        brands: BRANDS.map(b => ({
+        brands: brandsSource.map(b => ({
           id: b.id,
           name: b.name,
           parent: b.parent,
@@ -175,7 +184,7 @@ export async function GET(req: NextRequest) {
           brand_strength: b.brand_strength,
           notes: b.notes,
         })),
-        pois: BALI_POIS.map(p => ({
+        pois: poisSource.map(p => ({
           id: p.id,
           name: p.name,
           type: p.type,

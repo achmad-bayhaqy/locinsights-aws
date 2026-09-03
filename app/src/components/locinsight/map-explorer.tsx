@@ -165,7 +165,7 @@ export function MapExplorer({
 
   // Unified region level filter — applies to Opportunity + Demographics choropleth (Aug 2026)
   // Per user request: "Lebih baik filter region level diubah saja kebagian filters yang di atas agar cukup 1 saja"
-  const [unifiedRegionLevel, setUnifiedRegionLevel] = useState<RegionLevel>('kelurahan')
+  const [unifiedRegionLevel, setUnifiedRegionLevel] = useState<RegionLevel>('kecamatan')  // user default: Kecamatan
 
   // Demographic data (loaded from DB via API)
   const [kelurahanAll, setKelurahanAll] = useState<any[]>([])
@@ -198,15 +198,41 @@ export function MapExplorer({
 
   // Load kabupaten once
   useEffect(() => {
-    fetch('/api/locinsight/kabupaten?page=1&page_size=100')
+    fetch('/api/locinsight/kabupaten?page=1&page_size=1000')
       .then(r => r.json())
       .then(j => { if (j.success) setKabupatenAll(j.data || []) })
       .catch(() => {})
   }, [])
 
+  // Load countries + provinces from the DB (region dropdown — not Bali-only)
+  const [countriesAll, setCountriesAll] = useState<{ code: string; label: string }[]>([])
+  const [provincesAll, setProvincesAll] = useState<any[]>([])
+  useEffect(() => {
+    fetch('/api/locinsight/countries?page=1&page_size=100')
+      .then(r => r.json())
+      .then(j => {
+        if (j.success) setCountriesAll((j.data || []).map((c: any) => ({ code: c.id, label: c.name })))
+      })
+      .catch(() => {})
+    fetch('/api/locinsight/provinces?page=1&page_size=500')
+      .then(r => r.json())
+      .then(j => { if (j.success) setProvincesAll(j.data || []) })
+      .catch(() => {})
+  }, [])
+
+  // DB tier lookup (replaces the hardcoded Bali kabupaten tier map — works for all regions)
+  const kabTierByCode = useMemo(() => {
+    const m: Record<string, number> = {}
+    for (const k of kabupatenAll) {
+      const t = typeof k.tier === 'string' ? Number(k.tier.replace('tier_', '')) : k.tier
+      if (Number.isFinite(t)) m[k.name] = t as number
+    }
+    return m
+  }, [kabupatenAll])
+
   // ===== Region Filter (applies to ALL layers) — Country → Province → Kabupaten → Kecamatan → Kelurahan =====
   const [countryFilter, setCountryFilter] = useState<string>('ID')   // Default: Indonesia (Bali scope)
-  const [provinceFilter, setProvinceFilter] = useState<string>('Bali') // Default: Bali province
+  const [provinceFilter, setProvinceFilter] = useState<string>('Bali') // Legacy key; auto-corrected once provinces load
   const [kabFilter, setKabFilter] = useState<string>('all')
   const [kecFilter, setKecFilter] = useState<string>('all')
   const [kelurahanFilter, setKelurahanFilter] = useState<string>('all')
@@ -219,14 +245,20 @@ export function MapExplorer({
 
   const selected = opportunities.find(o => o.kelurahan_id === selectedKelurahanId)
 
-  // Static list of supported countries (Aug 2026: only Indonesia — but cascade architecture supports more)
-  const COUNTRY_OPTIONS = [
-    { code: 'ID', label: 'Indonesia' },
-  ]
-  // Static list of supported provinces for Indonesia (Aug 2026: only Bali — but cascade architecture supports more)
-  const PROVINCE_OPTIONS_BY_COUNTRY: Record<string, { code: string; label: string }[]> = {
-    ID: [{ code: 'Bali', label: 'Bali' }],
-  }
+  // DB-driven region options (Data Manager is the source of truth — works for
+  // all 38 provinces + the 8 expansion countries, not only Bali)
+  const COUNTRY_OPTIONS = useMemo(
+    () => (countriesAll.length ? countriesAll : [{ code: 'ID', label: 'Indonesia' }]),
+    [countriesAll],
+  )
+  const PROVINCE_OPTIONS_BY_COUNTRY = useMemo(() => {
+    const byC: Record<string, { code: string; label: string }[]> = {}
+    for (const p of provincesAll) {
+      const key = p.country_id || 'ID'
+      ;(byC[key] ||= []).push({ code: p.code, label: p.name })
+    }
+    return byC
+  }, [provincesAll])
 
   // Build cascading dropdown options from opportunities data
   const kabOptions = useMemo(() => {
@@ -252,6 +284,15 @@ export function MapExplorer({
     }
     return Array.from(set).sort()
   }, [opportunities, kecFilter])
+
+  // When DB provinces arrive, map the legacy 'Bali' default to its real DB code
+  useEffect(() => {
+    if (provincesAll.length === 0) return
+    if (provinceFilter === 'Bali') {
+      const bali = provincesAll.find(p => p.name === 'Bali')
+      if (bali) setProvinceFilter(bali.code)
+    }
+  }, [provincesAll, provinceFilter])
 
   // Reset child filters when parent changes
   useEffect(() => {
@@ -311,12 +352,7 @@ export function MapExplorer({
     if (!layerOn.stores) return []
     return stores.filter(s => {
       if (tierFilter !== 'all') {
-        const kabTier: Record<string, number> = {
-          Badung: 1, Denpasar: 1,
-          Tabanan: 2, Gianyar: 2, Buleleng: 2,
-          Jembrana: 3, Klungkung: 3, Bangli: 3, Karangasem: 3,
-        }
-        if (kabTier[s.kab] !== tierFilter) return false
+        if (kabTierByCode[s.kab] !== undefined && kabTierByCode[s.kab] !== tierFilter) return false
       }
       if (!isInRegion(s.kab, s.kec)) return false
       if (categoryFilter !== 'all' && s.brand_category !== categoryFilter) return false
@@ -332,19 +368,14 @@ export function MapExplorer({
       }
       return true
     })
-  }, [stores, layerOn.stores, tierFilter, kabFilter, kecFilter, categoryFilter, parentFilter, storeBrandFilter, storeNameFilter, search])
+  }, [stores, layerOn.stores, tierFilter, kabFilter, kecFilter, categoryFilter, parentFilter, storeBrandFilter, storeNameFilter, search, kabTierByCode])
 
   // ===== Filter malls (region + class) =====
   const filteredMalls = useMemo(() => {
     if (!layerOn.malls) return []
     return malls.filter(m => {
       if (tierFilter !== 'all') {
-        const kabTier: Record<string, number> = {
-          Badung: 1, Denpasar: 1,
-          Tabanan: 2, Gianyar: 2, Buleleng: 2,
-          Jembrana: 3, Klungkung: 3, Bangli: 3, Karangasem: 3,
-        }
-        if (kabTier[m.kab] !== tierFilter) return false
+        if (kabTierByCode[m.kab] !== undefined && kabTierByCode[m.kab] !== tierFilter) return false
       }
       if (!isInRegion(m.kab, m.kec)) return false
       // Mall Class filter (Aug 2026): super_regional / regional / community / specialty
@@ -356,7 +387,7 @@ export function MapExplorer({
       }
       return true
     })
-  }, [malls, layerOn.malls, tierFilter, kabFilter, kecFilter, mallClassFilter, search])
+  }, [malls, layerOn.malls, tierFilter, kabFilter, kecFilter, mallClassFilter, search, kabTierByCode])
 
   // ===== Filter POIs (region) =====
   const filteredPOIs = useMemo(() => {

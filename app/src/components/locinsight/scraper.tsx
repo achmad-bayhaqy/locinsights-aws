@@ -16,6 +16,7 @@ import { COMPETITOR_BRANDS } from '@/lib/data/competitor-brands'
 import { BRANDS } from '@/lib/data/brands'
 import { classifyScrapedBrand, type SaveTarget } from '@/lib/brand-classifier'
 import { useLanguage } from '@/lib/i18n/language-provider'
+import { fetchJson } from '@/lib/fetch-json'
 
 // ============================================================================
 // Types
@@ -128,8 +129,7 @@ export function Scraper() {
 
   // Load locations once on mount
   useEffect(() => {
-    fetch('/api/locinsight/locations')
-      .then(r => r.json())
+    fetchJson('/api/locinsight/locations', {}, 20_000)
       .then(j => {
         if (j.success) {
           setCountryList(j.data.countries || [])
@@ -151,8 +151,7 @@ export function Scraper() {
 
   async function fetchHistory() {
     try {
-      const res = await fetch('/api/locinsight/scrape?limit=20')
-      const json = await res.json()
+      const json = await fetchJson('/api/locinsight/scrape?limit=20', {}, 20_000)
       if (json.success) setHistory(json.data)
     } catch {}
   }
@@ -165,8 +164,7 @@ export function Scraper() {
     setSelKec('')
     setSelKel('')
     // Re-fetch provinces for the selected country
-    fetch(`/api/locinsight/locations?country_id=${encodeURIComponent(id)}`)
-      .then(r => r.json())
+    fetchJson(`/api/locinsight/locations?country_id=${encodeURIComponent(id)}`, {}, 20_000)
       .then(j => {
         if (j.success) {
           setProvinceList(j.data.provinces || [])
@@ -183,8 +181,7 @@ export function Scraper() {
     setSelKec('')
     setSelKel('')
     // Re-fetch kabupaten for the selected province
-    fetch(`/api/locinsight/locations?province_code=${encodeURIComponent(code)}`)
-      .then(r => r.json())
+    fetchJson(`/api/locinsight/locations?province_code=${encodeURIComponent(code)}`, {}, 20_000)
       .then(j => {
         if (j.success) {
           setKabupatenList(j.data.kabupaten || [])
@@ -292,12 +289,11 @@ export function Scraper() {
         body.brands = selectedBrands.length > 0 ? selectedBrands : undefined
       }
 
-      const res = await fetch('/api/locinsight/scrape', {
+      const json = await fetchJson('/api/locinsight/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      })
-      const json = await res.json()
+      }, 90_000)
       if (json.success) {
         setGeo(json.geocoded)
         setResults(json.results || [])
@@ -377,7 +373,7 @@ export function Scraper() {
     setSaving(true)
     try {
       const items = Array.from(selected).map(i => results[i])
-      const res = await fetch('/api/locinsight/scrape-save', {
+      const json = await fetchJson('/api/locinsight/scrape-save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -385,8 +381,7 @@ export function Scraper() {
           query,
           items,
         }),
-      })
-      const json = await res.json()
+      }, 60_000)
       if (json.success) {
         const s = json.saved
         const parts: string[] = []
