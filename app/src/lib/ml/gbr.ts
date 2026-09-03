@@ -151,14 +151,28 @@ function predictTree(node: TreeNode, x: number[]): number {
   return predictTree(node.right!, x)
 }
 
+/**
+ * Value of a subtree — leaf value, or the n_samples-weighted mean of its
+ * leaves. Needed because INTERNAL nodes do not carry `prediction`, so a naive
+ * `node.left!.prediction!` yields undefined → NaN → JSON null contributions
+ * (bug found in the v13 end-to-end sweep: some top_features.contribution were
+ * null exactly when the walked child was an internal node).
+ */
+function nodeValue(node: TreeNode): number {
+  if (node.leaf) return node.prediction ?? 0
+  const nL = node.left?.n_samples ?? 1
+  const nR = node.right?.n_samples ?? 1
+  return (nodeValue(node.left!) * nL + nodeValue(node.right!) * nR) / (nL + nR)
+}
+
 function treePathContributions(node: TreeNode, x: number[], contributions: number[]): void {
   if (node.leaf) return
   const f = node.feature!
   if (x[f] <= node.threshold!) {
-    contributions[f] = (contributions[f] || 0) + (node.left!.prediction! - (node.prediction ?? 0))
+    contributions[f] = (contributions[f] || 0) + (nodeValue(node.left!) - nodeValue(node))
     treePathContributions(node.left!, x, contributions)
   } else {
-    contributions[f] = (contributions[f] || 0) + (node.right!.prediction! - (node.prediction ?? 0))
+    contributions[f] = (contributions[f] || 0) + (nodeValue(node.right!) - nodeValue(node))
     treePathContributions(node.right!, x, contributions)
   }
 }

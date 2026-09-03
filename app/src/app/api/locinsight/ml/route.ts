@@ -19,6 +19,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { db, handleError } from '@/lib/api-helpers'
+import { Prisma } from '@prisma/client'
 import { requirePermission } from '@/lib/auth-server'
 import { setTenantContext, tenantFilter } from '@/lib/tenant-context'
 import { scoreAllKelurahan, getTopOpportunities } from '@/lib/scoring/engine'
@@ -66,9 +67,10 @@ const HEURISTIC_MODELS = [
     description: 'Classical Huff (1964) gravity model for retail trade-area analysis. Estimates P(customer at zone i visits store j) = (Attractiveness_j / Distance_ij^λ) / Σ_k(...). Attractiveness = store_size × brand_strength × format_factor. λ = 1.5 (F&B), 2.0 (sports), 1.9 (fashion), 2.2 (dept store).',
     features: ['population', 'density', 'income_index', 'tourist_index', 'transport_index', 'poi_density_index', 'mall_proximity_index', 'existing_store_density', 'brand_strength', 'store_size_m2'],
     hyperparameters: { lambda_fnb: 1.5, lambda_sports: 2.0, lambda_fashion: 1.9, lambda_dept: 2.2, trade_area_radius_km: 3 },
-    metrics: { mae: 4.2, rmse: 5.8, r2: 0.71, mape: 12.4 },
+    metrics: null as any,
+    evaluation: 'not statistically evaluated — deterministic scoring formula (no ground-truth revenue labels available yet)',
     status: 'active',
-    trained_at: '2026-07-15T00:00:00Z',
+    trained_at: null as any,
   },
   {
     id: 'mdl_kmeans_segment_v1',
@@ -76,12 +78,13 @@ const HEURISTIC_MODELS = [
     version: '1.0.0',
     type: 'cluster',
     algorithm: 'kmeans',
-    description: 'K-Means-style clustering of kelurahan into 6 trade-area archetypes: Premium Urban Core, Tourist Hub, Suburban Residential, Coastal Lifestyle, Transit Corridor, Rural Underserved.',
+    description: 'Deterministic rule-based segmentation of kelurahan into 6 trade-area archetypes: Premium Urban Core, Tourist Hub, Suburban Residential, Coastal Lifestyle, Transit Corridor, Rural Underserved. NOTE: rule-based, NOT a fitted K-Means model — clusters follow documented score thresholds.',
     features: ['urban_index', 'income_index', 'tourist_index', 'transport_index', 'poi_density_index', 'density', 'is_coastal'],
-    hyperparameters: { n_clusters: 6, init: 'k-means++', n_init: 10 },
-    metrics: { silhouette: 0.51, davies_bouldin: 0.62 },
+    hyperparameters: { n_archetypes: 6, method: 'score_threshold_rules' },
+    metrics: null as any,
+    evaluation: 'not statistically evaluated — deterministic rule-based segmentation (no ground-truth cluster labels available yet)',
     status: 'active',
-    trained_at: '2026-06-15T00:00:00Z',
+    trained_at: null as any,
   },
 ]
 
@@ -111,9 +114,9 @@ export async function GET(req: NextRequest) {
             description: m.description,
             features: JSON.stringify(m.features) as any,
             hyperparameters: JSON.stringify(m.hyperparameters) as any,
-            metrics: JSON.stringify(m.metrics) as any,
+            metrics: m.metrics === null ? Prisma.JsonNull : JSON.stringify(m.metrics) as any,
             status: m.status as any,
-            trained_at: new Date(m.trained_at),
+            trained_at: m.trained_at ? new Date(m.trained_at) : null,
           },
           update: {
             name: m.name,
@@ -123,9 +126,9 @@ export async function GET(req: NextRequest) {
             description: m.description,
             features: JSON.stringify(m.features) as any,
             hyperparameters: JSON.stringify(m.hyperparameters) as any,
-            metrics: JSON.stringify(m.metrics) as any,
+            metrics: m.metrics === null ? Prisma.JsonNull : JSON.stringify(m.metrics) as any,
             status: m.status as any,
-            trained_at: new Date(m.trained_at),
+            trained_at: m.trained_at ? new Date(m.trained_at) : null,
           },
         })
       }
@@ -197,7 +200,9 @@ export async function GET(req: NextRequest) {
     }
 
     if (action === 'feature_importance') {
-      const model = await loadModel()
+      // Fix: loadBestModel() prefers in-memory → DB artifact → bundled, so the
+      // importance shown matches the model actually serving predictions.
+      const model = await loadBestModel()
       if (!model) {
         // Fallback: get from latest training run in DB (tenant-scoped)
         const latestRun = await db.trainingRun.findFirst({

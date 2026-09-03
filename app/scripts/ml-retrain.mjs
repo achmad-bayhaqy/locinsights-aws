@@ -306,6 +306,106 @@ async function main() {
     datasetSize = X.length
     console.log(`[ml-retrain] dataset rows: ${datasetSize}`)
 
+    // ---- R4 → R2 ground-truth loop ----
+    // When the flywheel has accumulated >= 10 verified actual revenues
+    // (predictions.actual_revenue), merge them into the training set as REAL
+    // labels appended after the synthetic rows. The model then learns from
+    // reality where it exists while keeping enough rows for the holdout split.
+    let groundTruthSamples = 0
+    try {
+      const actuals = await prisma.$queryRawUnsafe(`
+        SELECT p.target_id AS kel_id, p.actual_revenue,
+               COALESCE(p.explanation->>'brand_id', 'BR001') AS brand_id
+        FROM predictions p
+        WHERE p.actual_revenue IS NOT NULL AND p.actual_revenue > 0
+        ORDER BY p.actual_recorded_at DESC NULLS LAST
+        LIMIT 500`)
+      if (actuals.length >= 10) {
+        const gtBrandIds = [...new Set(actuals.map(a => String(a.brand_id)))]
+        const gtKelIds = [...new Set(actuals.map(a => String(a.kel_id)))]
+        const gtBrands = await prisma.$queryRawUnsafe(`
+          SELECT id, COALESCE(brand_strength, 0.5) AS brand_strength,
+                 COALESCE(typical_size_m2, 100) AS typical_size_m2
+          FROM brands WHERE id = ANY($1::text[])`, gtBrandIds)
+        const gtBrandMap = new Map(gtBrands.map(b => [b.id, b]))
+        // kelurahan demographic rows for the actuals
+        const gtKels = await prisma.$queryRawUnsafe(`
+          SELECT id, population, area_km2, urban_index, income_index, tourist_index,
+                 transport_index, poi_density_index, is_coastal, tier
+          FROM kelurahan WHERE id = ANY($1::text[])`, gtKelIds)
+        const gtKelMap = new Map(gtKels.map(k => [k.id, k]))
+        // spatial features for (kel × brand) pairs — same bulk query as above
+        const gtFeat = await prisma.$queryRawUnsafe(`
+          WITH pts AS (
+            SELECT k.id AS kel_id, b.brand_id,
+                   ST_SetSRID(ST_MakePoint(k.lng, k.lat), 4326)::geography AS pt
+            FROM kelurahan k
+            CROSS JOIN (SELECT unnest($1::text[]) AS brand_id) b
+            WHERE k.id = ANY($2::text[])
+          ),
+          nearest_mall AS (
+            SELECT p.kel_id, MIN(m.d_km) AS d_km, MAX(m.gla_m2) AS gla_m2
+            FROM pts p
+            JOIN LATERAL (
+              SELECT ST_Distance(m.geom, p.pt) / 1000.0 AS d_km, m.gla_m2
+              FROM malls m WHERE COALESCE(m.gla_m2, 0) > 0
+              ORDER BY m.geom <-> p.pt LIMIT 1
+            ) m ON true
+            GROUP BY p.kel_id
+          ),
+          store_counts AS (
+            SELECT p.kel_id, p.brand_id,
+                   count(*) FILTER (WHERE st.brand_id = p.brand_id AND ST_DWithin(st.geom, p.pt, 2000))::int AS same_brand,
+                   count(*) FILTER (WHERE st.brand_id <> p.brand_id AND ST_DWithin(st.geom, p.pt, 2000))::int AS other_brand,
+                   count(*) FILTER (WHERE ST_DWithin(st.geom, p.pt, 5000))::int AS map_5km
+            FROM pts p
+            LEFT JOIN stores st ON ST_DWithin(st.geom, p.pt, 5000)
+            GROUP BY p.kel_id, p.brand_id
+          )
+          SELECT pts.kel_id, pts.brand_id,
+                 COALESCE(nm.d_km, 999) AS nearest_mall_distance_km,
+                 COALESCE(nm.gla_m2, 0) / 1000.0 AS nearest_mall_gla_k,
+                 COALESCE(sc.same_brand, 0) AS same_brand,
+                 COALESCE(sc.other_brand, 0) AS other_brand,
+                 COALESCE(sc.map_5km, 0) AS map_5km
+          FROM pts
+          LEFT JOIN nearest_mall nm ON nm.kel_id = pts.kel_id
+          LEFT JOIN store_counts sc ON sc.kel_id = pts.kel_id AND sc.brand_id = pts.brand_id`,
+          gtBrandIds, gtKelIds)
+        const gtFeatMap = new Map()
+        for (const r of gtFeat) gtFeatMap.set(`${r.kel_id}|${r.brand_id}`, r)
+
+        for (const a of actuals) {
+          const kel = gtKelMap.get(String(a.kel_id))
+          const brand = gtBrandMap.get(String(a.brand_id))
+          if (!kel || !brand) continue
+          const f = gtFeatMap.get(`${a.kel_id}|${a.brand_id}`) || {}
+          const density = Math.round(Number(kel.population || 0) / Math.max(1, Number(kel.area_km2 || 1)))
+          const tierRaw = String(kel.tier || '')
+          const tierNum = tierRaw.includes('tier_') ? Number(tierRaw.replace('tier_', '')) || 2 : 2
+          const touristMultiplier = 1 + (Number(kel.tourist_index || 30) / 100) * 1.5
+          X.push([
+            Number(kel.population || 0), density, Number(kel.urban_index || 50),
+            Number(kel.income_index || 50), Number(kel.tourist_index || 30),
+            Number(kel.transport_index || 50), Number(kel.poi_density_index || 30),
+            kel.is_coastal ? 1 : 0, tierNum,
+            Math.round(Number(f.nearest_mall_distance_km || 999) * 10) / 10,
+            Math.round(Number(f.nearest_mall_gla_k || 0)),
+            Number(f.same_brand || 0), Number(f.other_brand || 0), Number(f.map_5km || 0),
+            Number(brand.brand_strength), Number(brand.typical_size_m2),
+            Math.round(touristMultiplier * 100) / 100,
+          ])
+          y.push(Number(a.actual_revenue))
+          groundTruthSamples += 1
+        }
+        console.log(`[ml-retrain] merged ${groundTruthSamples} ground-truth actuals (R4 flywheel) into training set`)
+      } else {
+        console.log(`[ml-retrain] ground-truth actuals: ${actuals.length} (< 10) — synthetic-only training`)
+      }
+    } catch (gtErr) {
+      console.warn('[ml-retrain] ground-truth merge skipped:', gtErr?.message || gtErr)
+    }
+
     console.log('[ml-retrain] step 3/4 — training GBR with 80/20 holdout')
     // ---- holdout split ----
     const shuffled = X.map((_, i) => i)
@@ -354,28 +454,32 @@ async function main() {
       training_metrics: holdout,
       training_metrics_train: inSample,
       validation_split: VALIDATION_SPLIT,
+      ground_truth_samples: groundTruthSamples,
       trained_at: new Date().toISOString(),
     }
     const featureImportanceOut = featureImportance(model)
     const trainDuration = Date.now() - startTime
 
     console.log('[ml-retrain] step 4/4 — persisting model artifact to DB')
+    const registryVersion = model.version // keep registry version == artifact version
     await prisma.$executeRawUnsafe(`
       INSERT INTO ml_models (id, name, version, type, algorithm, description, features, hyperparameters, metrics, status, trained_at, created_at, updated_at)
-      VALUES ('mdl_gbr_revenue_v1', 'GBR Revenue Predictor v1', 'v1.scheduled', 'revenue_forecast', 'gbr_regressor',
+      VALUES ('mdl_gbr_revenue_v1', 'GBR Revenue Predictor v1', $5, 'revenue_forecast', 'gbr_regressor',
               $1, $2::jsonb, $3::jsonb, $4::jsonb, 'active', NOW(), NOW(), NOW())
       ON CONFLICT (id) DO UPDATE SET
         description = EXCLUDED.description,
+        version = EXCLUDED.version,
         features = EXCLUDED.features,
         hyperparameters = EXCLUDED.hyperparameters,
         metrics = EXCLUDED.metrics,
         status = 'active',
         trained_at = NOW(),
         updated_at = NOW()`,
-      `Scheduled retrain (ECS one-off). Pure-TS GBR on DB-backed dataset (${datasetSize} rows, all provinces) with 80/20 holdout.`,
+      `Scheduled retrain (ECS one-off). Pure-TS GBR on DB-backed dataset (${datasetSize} rows incl. ${groundTruthSamples} real ground-truth actuals) with 80/20 holdout.`,
       JSON.stringify(FEATURE_NAMES),
       JSON.stringify({ n_estimators: N_ESTIMATORS, max_depth: MAX_DEPTH, learning_rate: LEARNING_RATE, validation_split: VALIDATION_SPLIT }),
-      JSON.stringify({ ...holdout, evaluation: 'holdout', in_sample: inSample }),
+      JSON.stringify({ ...holdout, evaluation: 'holdout', in_sample: inSample, ground_truth_samples: groundTruthSamples }),
+      registryVersion,
     )
 
     await prisma.$executeRawUnsafe(`

@@ -145,8 +145,10 @@ async function resolveBrand(brandId?: string): Promise<(BrandRow & { source: 'db
 async function spatialFeatures(
   lat: number, lng: number, brandId: string, tenantId: string | null,
 ): Promise<{ nearest_mall_distance_km: number; nearest_mall_gla_k: number; same_brand_within_2km: number; other_brand_within_2km: number; map_stores_within_5km: number }> {
+  // lat/lng come from the DB as numbers (not user input); tenant_id and brand
+  // are bound as parameters ($1/$2) — no string interpolation of user data.
   const point = `ST_SetSRID(ST_MakePoint(${Number(lng)}, ${Number(lat)}), 4326)::geography`
-  const tenantClause = tenantId ? `AND tenant_id = '${tenantId.replace(/'/g, "''")}'` : ''
+  const tenantClause = tenantId ? 'AND tenant_id = $2' : ''
   const sql = `
     WITH nearest_mall AS (
       SELECT COALESCE(gla_m2, 0) AS gla_m2,
@@ -176,7 +178,9 @@ async function spatialFeatures(
       (SELECT n FROM map_stores) AS map_stores_within_5km
   `
   try {
-    const rows: any[] = await prisma.$queryRawUnsafe(sql, brandId)
+    const rows: any[] = tenantId
+      ? await prisma.$queryRawUnsafe(sql, brandId, tenantId)
+      : await prisma.$queryRawUnsafe(sql, brandId)
     const r = rows[0]
     return {
       nearest_mall_distance_km: Math.round(num(r.nearest_mall_distance_km, 999) * 10) / 10,

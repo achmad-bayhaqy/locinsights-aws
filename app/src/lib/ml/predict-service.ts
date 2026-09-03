@@ -119,6 +119,22 @@ export async function predictAndPersist(
   let persisted = false
   if (persist) {
     try {
+      // Dedup: repeated identical requests (user clicking twice, multiple UI
+      // widgets) must not flood the predictions table. Skip persist when an
+      // identical (model, target, brand) row already exists in the last 60 min.
+      const dedupSince = new Date(Date.now() - 60 * 60 * 1000)
+      const dup = await prisma.prediction.findFirst({
+        where: {
+          model_id: 'mdl_gbr_revenue_v1',
+          target_id: fv.kelurahan_id,
+          created_at: { gte: dedupSince },
+          explanation: { string_contains: fv.brand_id },
+        },
+        select: { id: true },
+      })
+      if (dup) {
+        persisted = true // already recorded — treat as persisted, no new row
+      } else {
       // FK requires the parent MLModel row — ensure it exists (idempotent,
       // cached after first success so we don't upsert on every request)
       if (!parentModelEnsured) {
@@ -167,6 +183,7 @@ export async function predictAndPersist(
         },
       })
       persisted = true
+      }
     } catch (e: any) {
       // Persistence is best-effort — never fail the prediction itself
       console.error('[predict-service] persist failed:', e?.message || e)
@@ -177,8 +194,8 @@ export async function predictAndPersist(
   return {
     ok: true,
     data: {
-      model_name: model.version,
-      model_version: `v1.0 (${model.n_estimators} trees, depth ${model.max_depth})`,
+      model_name: 'GBR Revenue Predictor v1',
+      model_version: model.version,
       predicted_revenue_juta: predicted,
       confidence: Math.round(confidence * 100) / 100,
       brand_used: fv.brand_name,

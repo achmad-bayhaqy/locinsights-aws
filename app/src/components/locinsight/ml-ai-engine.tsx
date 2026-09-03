@@ -205,9 +205,16 @@ export function MLAIEngine() {
               </Card>
 
               {models.map(m => {
-                const metrics = JSON.parse(m.metrics || '{}')
-                const features = JSON.parse(m.features || '[]')
-                const hp = JSON.parse(m.hyperparameters || '{}')
+                // jsonb columns may arrive as strings (legacy double-encoded)
+                // or as real objects (ml-retrain.mjs writes proper jsonb) —
+                // tolerate both to avoid JSON.parse('[object Object]') crashes.
+                const asObj = (v: unknown) =>
+                  typeof v === 'string' ? JSON.parse(v || '{}') : (v ?? {})
+                const asArr = (v: unknown) =>
+                  typeof v === 'string' ? JSON.parse(v || '[]') : Array.isArray(v) ? v : []
+                const metrics = asObj(m.metrics)
+                const features = asArr(m.features)
+                const hp = asObj(m.hyperparameters)
                 return (
                   <Card key={m.id} className="card-premium">
                     <CardContent className="p-4 space-y-3">

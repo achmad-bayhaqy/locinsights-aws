@@ -147,10 +147,12 @@ async function loadNearbyViaPostGIS(
   lat: number, lng: number, tenantId: string | null,
 ): Promise<[any[], any[], any[], any[]]> {
   const point = `ST_SetSRID(ST_MakePoint(${Number(lng)}, ${Number(lat)}), 4326)::geography`
-  const tenantClause = tenantId ? `AND tenant_id = '${tenantId.replace(/'/g, "''")}'` : ''
+  // tenant_id bound as $1 parameter (no string interpolation of user data)
+  const tenantClause = tenantId ? 'AND tenant_id = $1' : ''
+  const args = tenantId ? [tenantId] : []
 
   try {
-    const storesQ = prisma.$queryRawUnsafe<any[]>(`
+    const storesQ = `
       SELECT id, brand_id, brand_name, brand_category::text AS brand_category,
              parent::text AS parent, name, lat, lng, kec, kab,
              COALESCE(is_in_mall, false) AS is_in_mall, mall_id, mall_name,
@@ -160,16 +162,16 @@ async function loadNearbyViaPostGIS(
       FROM stores
       WHERE ST_DWithin(geom, ${point}, 5000) ${tenantClause}
       ORDER BY geom <-> ${point}
-      LIMIT 25`)
-    const competitorsQ = prisma.$queryRawUnsafe<any[]>(`
+      LIMIT 25`
+    const competitorsQ = `
       SELECT id, brand_name, brand_category::text AS brand_category, name,
              lat, lng, mall_name,
              ST_Distance(geom, ${point}) / 1000.0 AS distance_km
       FROM competitor_stores
       WHERE ST_DWithin(geom, ${point}, 5000) ${tenantClause}
       ORDER BY geom <-> ${point}
-      LIMIT 25`)
-    const mallsQ = prisma.$queryRawUnsafe<any[]>(`
+      LIMIT 25`
+    const mallsQ = `
       SELECT id, name, lat, lng, kec, kab, COALESCE(gla_m2, 0) AS gla_m2,
              COALESCE(opened_year, 0) AS opened_year, class::text AS class,
              COALESCE(visitor_estimate_daily, 0) AS visitor_estimate_daily,
@@ -177,17 +179,22 @@ async function loadNearbyViaPostGIS(
       FROM malls
       WHERE ST_DWithin(geom, ${point}, 10000) ${tenantClause}
       ORDER BY geom <-> ${point}
-      LIMIT 25`)
-    const poisQ = prisma.$queryRawUnsafe<any[]>(`
+      LIMIT 25`
+    const poisQ = `
       SELECT id, name, type::text AS type, lat, lng, kec, kab,
              COALESCE(magnitude, 0) AS magnitude, COALESCE(notes, '') AS notes,
              ST_Distance(geom, ${point}) / 1000.0 AS distance_km
       FROM pois
       WHERE ST_DWithin(geom, ${point}, 10000) ${tenantClause}
       ORDER BY geom <-> ${point}
-      LIMIT 25`)
+      LIMIT 25`
 
-    const [dbStores, dbCompetitors, dbMalls, dbPois] = await Promise.all([storesQ, competitorsQ, mallsQ, poisQ])
+    const [dbStores, dbCompetitors, dbMalls, dbPois] = await Promise.all([
+      prisma.$queryRawUnsafe<any[]>(storesQ, ...args),
+      prisma.$queryRawUnsafe<any[]>(competitorsQ, ...args),
+      prisma.$queryRawUnsafe<any[]>(mallsQ, ...args),
+      prisma.$queryRawUnsafe<any[]>(poisQ, ...args),
+    ])
 
     const roundKm = (r: any) => ({ ...r, distance_km: Math.round(Number(r.distance_km) * 100) / 100 })
 
