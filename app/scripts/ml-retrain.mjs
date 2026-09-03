@@ -184,7 +184,7 @@ async function main() {
              COALESCE(brand_strength, 0.5) AS brand_strength,
              COALESCE(typical_size_m2, 100) AS typical_size_m2
       FROM brands
-      WHERE id = ANY($1)`, REPRESENTATIVE_BRAND_IDS)
+      WHERE id = ANY($1::text[])`, REPRESENTATIVE_BRAND_IDS)
     const brandList = brands.length >= 1 ? brands : []
     if (brandList.length === 0) throw new Error('no representative brands found in DB')
 
@@ -205,8 +205,7 @@ async function main() {
       LEFT JOIN LATERAL (
         SELECT count(*)::int AS store_count
         FROM stores st
-        WHERE st.tenant_id = k.tenant_id
-          AND ST_DWithin(st.geom, ST_SetSRID(ST_MakePoint(k.lng, k.lat), 4326)::geography, 10000)
+        WHERE ST_DWithin(st.geom, ST_SetSRID(ST_MakePoint(k.lng, k.lat), 4326)::geography, 10000)
       ) store_rank ON true
       ORDER BY store_count DESC, random()
       LIMIT $1`, MAX_KELURAHAN)
@@ -224,11 +223,11 @@ async function main() {
     // Bulk feature table: for every sampled kelurahan and brand
     const featRows = await prisma.$queryRawUnsafe(`
       WITH pts AS (
-        SELECT k.id AS kel_id, b.id AS brand_id,
+        SELECT k.id AS kel_id, b.brand_id,
                ST_SetSRID(ST_MakePoint(k.lng, k.lat), 4326)::geography AS pt
         FROM kelurahan k
         CROSS JOIN (SELECT unnest($1::text[]) AS brand_id) b
-        WHERE k.id = ANY($2)
+        WHERE k.id = ANY($2::text[])
       ),
       nearest_mall AS (
         SELECT p.kel_id, MIN(m.d_km) AS d_km, MAX(m.gla_m2) AS gla_m2
@@ -246,8 +245,7 @@ async function main() {
                count(*) FILTER (WHERE st.brand_id <> p.brand_id AND ST_DWithin(st.geom, p.pt, 2000))::int AS other_brand,
                count(*) FILTER (WHERE ST_DWithin(st.geom, p.pt, 5000))::int AS map_5km
         FROM pts p
-        LEFT JOIN stores st ON st.tenant_id = (SELECT tenant_id FROM kelurahan WHERE id = p.kel_id)
-          AND ST_DWithin(st.geom, p.pt, 5000)
+        LEFT JOIN stores st ON ST_DWithin(st.geom, p.pt, 5000)
         GROUP BY p.kel_id, p.brand_id
       )
       SELECT pts.kel_id, pts.brand_id,
